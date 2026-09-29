@@ -1,42 +1,82 @@
-//
-//  MatrixSaver.m — modern macOS screen-saver app-extension wrapper.
-//
-//  The modern (Sonoma/Sequoia/Tahoe/27) third-party screen-saver format is an
-//  ExtensionKit .appex on the "com.apple.screensaver" extension point. Its
-//  principal class subclasses ScreenSaverExtension; the OS instantiates
-//  ScreenSaverViewControllerClass (a ScreenSaverViewController subclass) and
-//  shows its view full-screen. These two base classes are exported by
-//  ScreenSaver.framework but have no public headers, so we declare them here.
-//
+//  MatrixSaver.m — ExtensionKit .appex screensaver.
+//  Renderer selection by CONTEXT, not size (the thumbnail snapshot and the popover
+//  live-preview both lay out at the full 1920x1080, so a size split can't tell them
+//  from the real run):
+//    * offscreen thumbnail snapshot  -> our CG MatrixView (Monroe's Metal renders a
+//                                        blue default offscreen; CoreGraphics draws in
+//                                        ANY context, so the picker tile shows green rain)
+//    * on-screen Settings popover     -> our CG MatrixView (green, deterministic)
+//    * on-screen FULL-SCREEN run       -> Monroe Williams' real Metal Matrix (the one the
+//                                        user wants at idle)
+//  Discriminator: viewDidAppear fires only for on-screen contexts (never for the
+//  offscreen snapshot). A full-screen run is the only on-screen context whose window
+//  covers an entire NSScreen; the popover window does not.
 #import <AppKit/AppKit.h>
 #import <ScreenSaver/ScreenSaver.h>
+#define MXLOG(fmt, ...) NSLog(@"[MatrixSaver] " fmt, ##__VA_ARGS__)
 
-// --- Private modern base classes (linked from ScreenSaver.framework) ---
 @interface ScreenSaverExtension : NSObject
 @end
 @interface ScreenSaverViewController : NSViewController
+@property (nonatomic) BOOL initialAnimationState;
+@end
+@interface MatrixView : ScreenSaverView   // our CG renderer (MatrixView.m)
 @end
 
-@interface MatrixView : ScreenSaverView   // implemented in MatrixView.m
-@end
-
-// --- Principal class: thin, like Flurry.FlurryExtension / ComputerNameController ---
 @interface MatrixExtension : ScreenSaverExtension
 @end
 @implementation MatrixExtension
+- (instancetype)init { self=[super init]; MXLOG(@"MatrixExtension init"); return self; }
 @end
 
-// --- View controller: vends the ScreenSaverView, mirrors ComputerNameViewController ---
 @interface MatrixViewController : ScreenSaverViewController
 @end
-@implementation MatrixViewController
-
-- (void)loadView {
-    NSRect frame = NSMakeRect(0, 0, 1920, 1080);
-    MatrixView *v = [[MatrixView alloc] initWithFrame:frame isPreview:NO];
-    v.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-    self.view = v;
-    [v startAnimation];
+@implementation MatrixViewController {
+    ScreenSaverView *_saver;
+    BOOL _isMonroe;
 }
-
+- (void)loadView {
+    self.view = [[NSView alloc] initWithFrame:NSMakeRect(0,0,1920,1080)];
+    self.view.autoresizesSubviews = NO;
+}
+- (ScreenSaverView *)makeMonroeWithFrame:(NSRect)f {
+    NSString *base=[NSBundle bundleForClass:[self class]].bundlePath;
+    NSBundle *mb=[NSBundle bundleWithPath:[base stringByAppendingPathComponent:@"Contents/Resources/Matrix.saver"]];
+    NSError *e=nil; if(![mb loadAndReturnError:&e]){ MXLOG(@"Monroe load FAIL %@",e); return nil; }
+    Class c=[mb principalClass];
+    return c ? [[c alloc] initWithFrame:f isPreview:NO] : nil;
+}
+- (void)installSaver:(ScreenSaverView *)v monroe:(BOOL)monroe {
+    if (_saver) { @try { [_saver stopAnimation]; } @catch(...){} [_saver removeFromSuperview]; _saver=nil; }
+    if (!v) return;
+    v.frame=self.view.bounds; v.autoresizingMask=NSViewNotSizable;
+    [self.view addSubview:v]; _saver=v; _isMonroe=monroe;
+    @try { [v startAnimation]; } @catch(...){}
+}
+// Default (also the offscreen thumbnail path): green CoreGraphics rain.
+- (void)viewDidLayout {
+    [super viewDidLayout];
+    NSRect b=self.view.bounds;
+    if (b.size.width<2 || b.size.height<2) return;
+    if (!_saver) {
+        [self installSaver:[[MatrixView alloc] initWithFrame:b isPreview:YES] monroe:NO];
+        MXLOG(@"layout -> CG MatrixView (%.0fx%.0f)", b.size.width, b.size.height);
+    } else {
+        _saver.frame=b;
+    }
+}
+// viewDidAppear fires for every ON-SCREEN host — the full-screen idle run AND the
+// Settings popover live preview (in macOS 26/27 both are the same wallpaper-agent
+// path, at the same window level, so they cannot be told apart). Both want Monroe's
+// real Metal Matrix: green full-screen, visible rain in the preview. It is NEVER
+// called for the offscreen thumbnail snapshot, which keeps the safe CG render (Monroe's
+// Metal cannot draw into that offscreen context and would crash / go blank).
+- (void)viewDidAppear {
+    [super viewDidAppear];
+    if (_isMonroe) return;
+    NSWindow *w=self.view.window;
+    MXLOG(@"viewDidAppear level=%ld -> Monroe", w?(long)w.level:-999);
+    ScreenSaverView *m=[self makeMonroeWithFrame:self.view.bounds];
+    if (m) { [self installSaver:m monroe:YES]; MXLOG(@"on-screen -> Monroe %@", m); }
+}
 @end

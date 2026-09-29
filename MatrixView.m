@@ -1,150 +1,162 @@
 //
-//  MatrixView.m — classic Matrix digital-rain, hosted by the modern
-//  ScreenSaver app-extension. Subclasses ScreenSaverView and uses the
-//  well-supported ScreenSaverView drawing contract
-//  (initWithFrame:isPreview:, animateOneFrame, drawRect:).
+//  MatrixView.m — 3D "flying into the depth" Matrix rain.
+//
+//  Reproduces the GLMatrix-style effect (glyph streams positioned in 3D space
+//  that recede into the distance, shrinking and fading into darkness) using
+//  perspective-projected Core Graphics text drawing. CG renders reliably inside
+//  the sandboxed screensaver host on macOS 27, unlike OpenGL (which renders
+//  black) — so the classic 3D effect is ported forward natively.
 //
 #import <ScreenSaver/ScreenSaver.h>
 #import <AppKit/AppKit.h>
+
+#define NSTREAMS 240
+
+typedef struct {
+    double x, y, z;     // world position of the stream head
+    double vz;          // recede speed (into the distance)
+    double vy;          // fall speed
+    int    len;         // number of glyphs in the column
+    int    glyph[40];   // glyph indices (index into palette)
+    double mutTimer;    // for occasional glyph mutation
+} Stream;
 
 @interface MatrixView : ScreenSaverView
 @end
 
 @implementation MatrixView {
-    NSInteger        _cols, _rows;
-    CGFloat          _cell;
-    NSFont          *_font;
-    NSArray<NSString*> *_glyphs;   // glyph palette
-    int16_t         *_grid;        // _cols*_rows, -1 = empty, else index into _glyphs
-    CGFloat         *_head;        // head row (fractional) per column
-    CGFloat         *_speed;       // rows/frame per column
-    NSColor         *_headColor, *_bodyColor, *_dimColor;
-    NSTimer         *_timer;
+    NSArray<NSString*> *_glyphs;
+    NSMutableArray<NSFont*> *_fontCache;   // index = point size
+    Stream *_streams;
+    double  _cellH;      // world height of one glyph cell
+    double  _zNear, _zFar;
+    NSTimer *_timer;
+    BOOL _preview;
 }
 
 - (instancetype)initWithFrame:(NSRect)frame isPreview:(BOOL)isPreview {
     self = [super initWithFrame:frame isPreview:isPreview];
     if (self) {
-        self.wantsLayer = YES;
-        _cell = isPreview ? 8.0 : 18.0;
-        _font = [NSFont fontWithName:@"Menlo-Bold" size:_cell]
-              ?: [NSFont monospacedSystemFontOfSize:_cell weight:NSFontWeightBold];
+        _preview = isPreview;
+        NSLog(@"[MatrixSaver] MatrixView initWithFrame preview=%d bounds=%@", isPreview, NSStringFromRect(frame));
 
         NSMutableArray *g = [NSMutableArray array];
-        for (unichar c = 0xFF66; c <= 0xFF9D; c++)          // half-width katakana
+        for (unichar c = 0xFF66; c <= 0xFF9D; c++)             // half-width katakana
             [g addObject:[NSString stringWithCharacters:&c length:1]];
-        NSString *extra = @"0123456789:.=*+-<>|Z";
+        NSString *extra = @"0123456789:.=*+<>|Z";
         for (NSUInteger i = 0; i < extra.length; i++) {
             unichar c = [extra characterAtIndex:i];
             [g addObject:[NSString stringWithCharacters:&c length:1]];
         }
         _glyphs = g;
 
-        _headColor = [NSColor colorWithRed:0.85 green:1.00 blue:0.85 alpha:1.0];
-        _bodyColor = [NSColor colorWithRed:0.20 green:1.00 blue:0.35 alpha:1.0];
-        _dimColor  = [NSColor colorWithRed:0.00 green:0.50 blue:0.16 alpha:1.0];
+        _fontCache = [NSMutableArray array];
+        for (int i = 0; i <= 320; i++) [_fontCache addObject:(NSFont*)[NSNull null]];
 
-        [self buildGrid];
+        _cellH = 0.052;
+        _zNear = 1.2;
+        _zFar  = 17.0;
+
+        _streams = calloc(NSTREAMS, sizeof(Stream));
+        for (int i = 0; i < NSTREAMS; i++) [self respawn:&_streams[i] initial:YES];
+
+        [self setAnimationTimeInterval:1.0/30.0];
     }
     return self;
 }
 
-- (void)dealloc { [self teardown]; }
+- (void)dealloc { if (_streams) free(_streams); }
 
-- (void)teardown {
-    [_timer invalidate]; _timer = nil;
-    if (_grid)  { free(_grid);  _grid  = NULL; }
-    if (_head)  { free(_head);  _head  = NULL; }
-    if (_speed) { free(_speed); _speed = NULL; }
+static double frand(double a, double b) { return a + (b - a) * (arc4random_uniform(100000) / 100000.0); }
+
+- (void)respawn:(Stream*)s initial:(BOOL)initial {
+    s->x  = frand(-2.6, 2.6);
+    s->y  = frand(-1.7, 2.4);
+    s->z  = initial ? frand(_zNear, _zFar) : frand(_zNear, _zNear + 3.0);
+    s->vz = frand(0.010, 0.055);            // recede into depth
+    s->vy = frand(0.010, 0.035);            // gentle fall
+    s->len = (int)frand(9, 30);
+    s->mutTimer = 0;
+    for (int k = 0; k < s->len; k++)
+        s->glyph[k] = arc4random_uniform((uint32_t)_glyphs.count);
 }
 
-- (void)buildGrid {
-    [_timer invalidate]; _timer = nil;
-    if (_grid)  { free(_grid);  _grid  = NULL; }
-    if (_head)  { free(_head);  _head  = NULL; }
-    if (_speed) { free(_speed); _speed = NULL; }
-
-    NSRect b = self.bounds;
-    _cols = MAX(1, (NSInteger)(b.size.width  / _cell));
-    _rows = MAX(1, (NSInteger)(b.size.height / _cell)) + 2;
-
-    _grid  = malloc(sizeof(int16_t) * _cols * _rows);
-    for (NSInteger i = 0; i < _cols * _rows; i++) _grid[i] = -1;
-    _head  = calloc(_cols, sizeof(CGFloat));
-    _speed = calloc(_cols, sizeof(CGFloat));
-    for (NSInteger c = 0; c < _cols; c++) {
-        _head[c]  = -(CGFloat)arc4random_uniform((uint32_t)_rows);
-        _speed[c] = 0.25 + arc4random_uniform(70) / 100.0;
+- (NSFont*)fontForSize:(int)sz {
+    if (sz < 1) sz = 1; if (sz > 320) sz = 320;
+    id f = _fontCache[sz];
+    if (f == [NSNull null]) {
+        f = [NSFont fontWithName:@"Menlo-Bold" size:sz]
+          ?: [NSFont monospacedSystemFontOfSize:sz weight:NSFontWeightBold];
+        _fontCache[sz] = f;
     }
+    return f;
 }
 
-- (void)setFrameSize:(NSSize)newSize {
-    [super setFrameSize:newSize];
-    [self buildGrid];
-}
-
-- (int16_t)rndIdx { return (int16_t)arc4random_uniform((uint32_t)_glyphs.count); }
-
-// Drive our own timer so rendering is guaranteed regardless of how the host
-// hosts us (SSENeedsAnimationTimer is left false in Info.plist).
-- (void)startAnimation {
-    [super startAnimation];
-    if (!_timer) {
-        _timer = [NSTimer timerWithTimeInterval:1.0/30.0 target:self
-                                       selector:@selector(step) userInfo:nil repeats:YES];
-        [[NSRunLoop currentRunLoop] addTimer:_timer forMode:NSRunLoopCommonModes];
-    }
-}
-- (void)stopAnimation { [_timer invalidate]; _timer = nil; [super stopAnimation]; }
-- (void)step { [self animateOneFrame]; }
+- (void)startAnimation { [super startAnimation]; }
+- (void)stopAnimation  { [super stopAnimation]; }
 
 - (void)animateOneFrame {
-    if (!_grid) return;
-    for (NSInteger c = 0; c < _cols; c++) {
-        NSInteger oldH = (NSInteger)floor(_head[c]);
-        _head[c] += _speed[c];
-        NSInteger newH = (NSInteger)floor(_head[c]);
-        for (NSInteger r = oldH + 1; r <= newH; r++)
-            if (r >= 0 && r < _rows) _grid[c * _rows + r] = [self rndIdx];
-        if (_head[c] - 34 > _rows)
-            _head[c] = -(CGFloat)arc4random_uniform((uint32_t)_rows);
-    }
-    // flicker: mutate a few live cells
-    for (NSInteger k = 0; k < _cols / 3 + 1; k++) {
-        NSInteger c = arc4random_uniform((uint32_t)_cols);
-        NSInteger r = arc4random_uniform((uint32_t)_rows);
-        if (_grid[c * _rows + r] >= 0) _grid[c * _rows + r] = [self rndIdx];
+    static int _al=0; if(!_al++) NSLog(@"[MatrixSaver] animateOneFrame first");
+    for (int i = 0; i < NSTREAMS; i++) {
+        Stream *s = &_streams[i];
+        s->z += s->vz;
+        s->y -= s->vy;
+        s->mutTimer += 1;
+        if (s->mutTimer > 3) {                 // flicker a random glyph
+            s->mutTimer = 0;
+            s->glyph[arc4random_uniform((uint32_t)s->len)] = arc4random_uniform((uint32_t)_glyphs.count);
+        }
+        double bottom = s->y - s->len * _cellH;
+        if (s->z > _zFar || bottom > 2.6) [self respawn:s initial:NO];
     }
     [self setNeedsDisplay:YES];
 }
 
 - (void)drawRect:(NSRect)rect {
+    static int _dl=0; if(!_dl++) NSLog(@"[MatrixSaver] drawRect first bounds=%@", NSStringFromRect(self.bounds));
     [[NSColor blackColor] setFill];
     NSRectFill(rect);
-    if (!_grid) return;
 
-    CGFloat H = self.bounds.size.height;
-    const NSInteger trail = 24;
-    for (NSInteger c = 0; c < _cols; c++) {
-        NSInteger hr = (NSInteger)floor(_head[c]);
-        CGFloat x = c * _cell;
-        for (NSInteger t = 0; t < trail; t++) {
-            NSInteger r = hr - t;
-            if (r < 0 || r >= _rows) continue;
-            int16_t gi = _grid[c * _rows + r];
-            if (gi < 0) continue;
-            NSColor *col;
-            if (t == 0)      col = _headColor;
-            else if (t < 8)  col = _bodyColor;
-            else {
-                CGFloat f = 1.0 - (CGFloat)(t - 8) / (trail - 8);
-                col = [_dimColor colorWithAlphaComponent:MAX(0.05, f)];
-            }
-            CGFloat y = H - (r + 1) * _cell;
-            [_glyphs[gi] drawAtPoint:NSMakePoint(x, y)
-                      withAttributes:@{ NSFontAttributeName: _font,
-                                        NSForegroundColorAttributeName: col }];
+    double W = self.bounds.size.width, H = self.bounds.size.height;
+    double cx = W * 0.5, cy = H * 0.5;
+    double F = W * 0.82;                        // focal length
+
+    // draw far streams first for correct depth overlap
+    int *order = malloc(sizeof(int) * NSTREAMS);
+    for (int i = 0; i < NSTREAMS; i++) order[i] = i;
+    for (int a = 0; a < NSTREAMS - 1; a++)      // simple insertion by z desc
+        for (int b = a + 1; b < NSTREAMS; b++)
+            if (_streams[order[b]].z > _streams[order[a]].z) { int t = order[a]; order[a] = order[b]; order[b] = t; }
+
+    for (int oi = 0; oi < NSTREAMS; oi++) {
+        Stream *s = &_streams[order[oi]];
+        if (s->z <= 0.15) continue;
+        double depthAlpha = (_zFar - s->z) / (_zFar - _zNear);
+        if (depthAlpha < 0.04) continue;
+        if (depthAlpha > 1) depthAlpha = 1;
+
+        for (int k = s->len - 1; k >= 0; k--) {
+            double wy = s->y + k * _cellH;                 // k=0 head (bottom), grows upward
+            double sx = cx + F * s->x / s->z;
+            double sy = cy + F * wy   / s->z;              // y-up
+            double size = F * _cellH / s->z;
+            if (size < 2.0) break;                         // whole stream too far/small
+            if (sx < -size || sx > W + size || sy < -size || sy > H + size) continue;
+
+            double r, g, b, a;
+            if (k == 0)      { r = 0.80; g = 1.00; b = 0.85; }        // bright head
+            else if (k < 4)  { r = 0.30; g = 1.00; b = 0.45; }
+            else             { double f = 1.0 - (double)(k - 4) / (s->len); if (f < 0.12) f = 0.12; r = 0.0; g = 0.85 * f; b = 0.22 * f; }
+            a = depthAlpha * (k == 0 ? 1.0 : 0.92);
+
+            NSFont *font = [self fontForSize:(int)(size)];
+            NSDictionary *attr = @{ NSFontAttributeName: font,
+                                    NSForegroundColorAttributeName:[NSColor colorWithRed:r green:g blue:b alpha:a] };
+            NSString *gl = _glyphs[s->glyph[k]];
+            NSSize gs = [gl sizeWithAttributes:attr];
+            [gl drawAtPoint:NSMakePoint(sx - gs.width * 0.5, sy - gs.height * 0.5) withAttributes:attr];
         }
     }
+    free(order);
 }
 @end
