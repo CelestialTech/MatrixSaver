@@ -1,0 +1,5 @@
+build/
+*.bak
+*.bak2
+*.cg-bak
+.DS_Store

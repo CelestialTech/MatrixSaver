@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/hero.gif" alt="Matrix digital-rain screensaver — green katakana glyph streams flying into depth on black" width="100%">
+</p>
+
 # Matrix screensaver — modern macOS 27 App Extension (`.appex`)
 
 A native Matrix digital-rain screensaver for macOS 14–27, built in the **modern

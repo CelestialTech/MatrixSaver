@@ -1,7 +1,8 @@
 #!/bin/bash
 # Build + install the modern Matrix screen-saver .appex (macOS 14+/27).
 set -e
-SRC="$HOME/src/MatrixSaver"
+# self-locating: sources live alongside this script (repo root)
+SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD="$SRC/build"
 APP="$BUILD/MatrixSaver.app"
 APPEX="$APP/Contents/PlugIns/MatrixSaver.appex"
