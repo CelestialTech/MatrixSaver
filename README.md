@@ -4,7 +4,7 @@
 
 <h1 align="center">MatrixSaver</h1>
 
-<p align="center"><em>The Matrix digital rain, as a real macOS screensaver — a modern, notarized ExtensionKit app extension that runs on macOS 14 through 27.</em></p>
+<p align="center"><em>The Matrix digital rain as a real macOS screensaver — a modern ExtensionKit app extension for macOS 14 through 27.</em></p>
 
 <p align="center">
   <img alt="macOS 14–27" src="https://img.shields.io/badge/macOS-14–27-black?logo=apple&logoColor=white">
@@ -39,9 +39,7 @@ Download the notarized installer from the
    *(You can also download and run `MatrixSaver.pkg` directly, without the DMG.)*
 3. Open **System Settings → Screen Saver**, and pick **Matrix**.
 
-Both the `.dmg` and the enclosed `.pkg` are signed with a Developer ID and **notarized and
-stapled** by Apple, so they install with no Gatekeeper block — no "cannot be opened because
-the developer cannot be verified", no right-click *Open anyway*.
+Signed and notarized, so it installs without any Gatekeeper prompt.
 
 ## Requirements
 
