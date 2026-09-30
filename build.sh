@@ -19,6 +19,16 @@ clang -fobjc-arc -O2 -arch arm64 -mmacosx-version-min=14.0 \
     "$SRC/MatrixView.m" "$SRC/MatrixSaver.m" \
     -o "$APPEX/Contents/MacOS/MatrixSaver"
 cp "$SRC/Info-appex.plist" "$APPEX/Contents/Info.plist"
+
+# Stage Monroe Williams' Matrix.saver (the full-screen Metal renderer). It is NOT in this
+# repo — obtain it and place it at "$SRC/Matrix.saver" (see README > Build from source).
+if [ -d "$SRC/Matrix.saver" ]; then
+    cp -R "$SRC/Matrix.saver" "$APPEX/Contents/Resources/"
+    echo "staged Matrix.saver"
+else
+    echo "WARNING: $SRC/Matrix.saver not found — full-screen renderer will be unavailable (CG rain only)"
+fi
+
 echo "appex exec:"; file "$APPEX/Contents/MacOS/MatrixSaver"
 
 echo "=== compile host app executable ==="

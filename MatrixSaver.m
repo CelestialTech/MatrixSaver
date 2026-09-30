@@ -1,16 +1,14 @@
 //  MatrixSaver.m — ExtensionKit .appex screensaver.
-//  Renderer selection by CONTEXT, not size (the thumbnail snapshot and the popover
-//  live-preview both lay out at the full 1920x1080, so a size split can't tell them
-//  from the real run):
-//    * offscreen thumbnail snapshot  -> our CG MatrixView (Monroe's Metal renders a
-//                                        blue default offscreen; CoreGraphics draws in
-//                                        ANY context, so the picker tile shows green rain)
-//    * on-screen Settings popover     -> our CG MatrixView (green, deterministic)
-//    * on-screen FULL-SCREEN run       -> Monroe Williams' real Metal Matrix (the one the
-//                                        user wants at idle)
-//  Discriminator: viewDidAppear fires only for on-screen contexts (never for the
-//  offscreen snapshot). A full-screen run is the only on-screen context whose window
-//  covers an entire NSScreen; the popover window does not.
+//  Renderer selection by CONTEXT, not size (the offscreen thumbnail snapshot and every
+//  on-screen host all lay out at the full 1920x1080, so a size split can't tell them apart):
+//    * offscreen thumbnail snapshot -> the CG MatrixView (Monroe's Metal renders blank
+//                                       offscreen; CoreGraphics draws in ANY context, so the
+//                                       picker tile shows green rain)
+//    * any ON-SCREEN host            -> Monroe Williams' real Metal Matrix
+//  On macOS 26/27 the Settings popover preview and the real full-screen idle run are the
+//  same wallpaper-agent render path at the same window level, so they can't be told apart
+//  from inside the extension — both are on-screen, so both get Monroe. viewDidAppear fires
+//  only for an on-screen host, never for the offscreen snapshot, which keeps the CG renderer.
 #import <AppKit/AppKit.h>
 #import <ScreenSaver/ScreenSaver.h>
 #define MXLOG(fmt, ...) NSLog(@"[MatrixSaver] " fmt, ##__VA_ARGS__)
