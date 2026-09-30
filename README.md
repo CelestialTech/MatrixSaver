@@ -242,11 +242,6 @@ killall WallpaperAgent
 
 ## License
 
-> **This repository does not yet ship a `LICENSE` file.** Until one is added, the original code
-> is "all rights reserved" by default.
-
-A reasonable setup: license the **original code** (the `MatrixView` renderer, the ExtensionKit
-glue, `build.sh`) under a permissive license such as **MIT**, while keeping Monroe Williams'
-bundled `Matrix.saver` under **its own terms** (stated in [Credits](#credits--references)) — a
-license on this project's code does not relicense his work, and his redistribution terms should
-be confirmed before bundling. This is a suggestion, not a decision.
+This project ships no `LICENSE` file; the original code is provided as-is, all rights reserved.
+Monroe Williams' bundled `Matrix.saver` is a third-party work under its own terms — see
+[Credits](#credits--references).
