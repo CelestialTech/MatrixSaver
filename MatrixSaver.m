@@ -32,6 +32,7 @@
 @implementation MatrixViewController {
     ScreenSaverView *_saver;
     BOOL _isMonroe;
+    id _activity;   // NSProcessInfo activity token — keeps the render timer un-throttled
 }
 - (void)loadView {
     self.view = [[NSView alloc] initWithFrame:NSMakeRect(0,0,1920,1080)];
@@ -71,10 +72,24 @@
 // Metal cannot draw into that offscreen context and would crash / go blank).
 - (void)viewDidAppear {
     [super viewDidAppear];
+    // On-screen: opt out of App Nap / timer coalescing. WallpaperAgent otherwise
+    // lets runningboardd park this extension at AppNap timer Tier5 on battery Macs
+    // (the MacBook Air), which starves the animation timer and makes the rain
+    // stall to a dark freeze then redraw. A UserInitiated+LatencyCritical activity
+    // assertion, held for the controller's lifetime, keeps the timer firing.
+    if (!_activity) {
+        _activity = [[NSProcessInfo processInfo]
+            beginActivityWithOptions:(NSActivityUserInitiated | NSActivityLatencyCritical)
+                              reason:@"MatrixSaver rendering"];
+        MXLOG(@"began NSProcessInfo activity (anti App-Nap timer throttle)");
+    }
     if (_isMonroe) return;
     NSWindow *w=self.view.window;
     MXLOG(@"viewDidAppear level=%ld -> Monroe", w?(long)w.level:-999);
     ScreenSaverView *m=[self makeMonroeWithFrame:self.view.bounds];
     if (m) { [self installSaver:m monroe:YES]; MXLOG(@"on-screen -> Monroe %@", m); }
+}
+- (void)dealloc {
+    if (_activity) { [[NSProcessInfo processInfo] endActivity:_activity]; _activity=nil; }
 }
 @end
