@@ -1,5 +1,10 @@
+.DS_Store
 build/
+pkgbuild_work/
+dist/
+*.o
+# scratch backups belong in git history, not alongside the source
 *.bak
 *.bak2
 *.cg-bak
-.DS_Store
+*-bak
