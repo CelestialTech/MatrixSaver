@@ -1,11 +1,20 @@
 //
-//  MatrixView.m — 3D "flying into the depth" Matrix rain.
+//  MatrixView.m — 3D "flying into the depth" Matrix rain (CoreGraphics).
 //
-//  Reproduces the GLMatrix-style effect (glyph streams positioned in 3D space
-//  that recede into the distance, shrinking and fading into darkness) using
-//  perspective-projected Core Graphics text drawing. CG renders reliably inside
-//  the sandboxed screensaver host on macOS 27, unlike OpenGL (which renders
-//  black) — so the classic 3D effect is ported forward natively.
+//  Reproduces the GLMatrix-style effect (glyph streams positioned in 3D space that recede
+//  into the distance, shrinking and fading into darkness) using perspective-projected Core
+//  Graphics text drawing. CG renders reliably inside the sandboxed screensaver host on
+//  macOS 27, unlike OpenGL (which renders black) — so the classic 3D effect is ported
+//  forward natively. This is the OFFSCREEN THUMBNAIL renderer; the on-screen idle run uses
+//  Monroe's Metal Matrix (see MatrixSaver.m).
+//
+//  Performance (rewritten 2026-10-16): the draw path previously malloc'd an index buffer
+//  and ran an O(n^2) insertion sort over 240 streams on EVERY frame, and measured every
+//  glyph with -sizeWithAttributes:. The depth sort is now qsort over a persistent buffer
+//  and glyph metrics are cached per point size, so a frame no longer allocates or does
+//  quadratic work. The view also drives its own NSTimer (Info-appex.plist sets
+//  SSENeedsAnimationTimer=false) so it does not depend on the flaky framework timer and
+//  it stops cleanly the moment it leaves the screen.
 //
 #import <ScreenSaver/ScreenSaver.h>
 #import <AppKit/AppKit.h>
@@ -27,10 +36,12 @@ typedef struct {
 @implementation MatrixView {
     NSArray<NSString*> *_glyphs;
     NSMutableArray<NSFont*> *_fontCache;   // index = point size
+    double  *_advCache;                    // cached glyph half-size per point size
     Stream *_streams;
+    int    *_order;      // persistent back-to-front draw order (no per-frame malloc)
     double  _cellH;      // world height of one glyph cell
     double  _zNear, _zFar;
-    NSTimer *_timer;
+    NSTimer *_timer;     // self-driven (SSENeedsAnimationTimer=false)
     BOOL _preview;
 }
 
@@ -52,20 +63,27 @@ typedef struct {
 
         _fontCache = [NSMutableArray array];
         for (int i = 0; i <= 320; i++) [_fontCache addObject:(NSFont*)[NSNull null]];
+        _advCache = calloc(321, sizeof(double));   // 0 = not yet measured
 
         _cellH = 0.052;
         _zNear = 1.2;
         _zFar  = 17.0;
 
         _streams = calloc(NSTREAMS, sizeof(Stream));
-        for (int i = 0; i < NSTREAMS; i++) [self respawn:&_streams[i] initial:YES];
+        _order   = calloc(NSTREAMS, sizeof(int));
+        for (int i = 0; i < NSTREAMS; i++) { [self respawn:&_streams[i] initial:YES]; _order[i] = i; }
 
         [self setAnimationTimeInterval:1.0/30.0];
     }
     return self;
 }
 
-- (void)dealloc { if (_streams) free(_streams); }
+- (void)dealloc {
+    [_timer invalidate];
+    if (_streams) free(_streams);
+    if (_order)   free(_order);
+    if (_advCache) free(_advCache);
+}
 
 static double frand(double a, double b) { return a + (b - a) * (arc4random_uniform(100000) / 100000.0); }
 
@@ -92,11 +110,36 @@ static double frand(double a, double b) { return a + (b - a) * (arc4random_unifo
     return f;
 }
 
-- (void)startAnimation { [super startAnimation]; }
-- (void)stopAnimation  { [super stopAnimation]; }
+// Half of a representative (monospaced) glyph box at a point size, measured once per size.
+// Used only to centre the glyph on its projected point; exact per-glyph metrics are
+// unnecessary for a monospaced font and measuring every glyph every frame was the hot spot.
+- (double)halfAdvanceForSize:(int)sz font:(NSFont*)font {
+    if (sz < 1) sz = 1; if (sz > 320) sz = 320;
+    if (_advCache[sz] == 0.0) {
+        NSSize gs = [@"M" sizeWithAttributes:@{ NSFontAttributeName: font }];
+        _advCache[sz] = gs.width * 0.5;
+    }
+    return _advCache[sz];
+}
+
+- (void)startAnimation {
+    [super startAnimation];
+    if (!_timer) {
+        _timer = [NSTimer scheduledTimerWithTimeInterval:1.0/30.0 target:self
+                    selector:@selector(animateOneFrame) userInfo:nil repeats:YES];
+        _timer.tolerance = 1.0/120.0;                       // let the OS coalesce a little
+        [[NSRunLoop currentRunLoop] addTimer:_timer forMode:NSRunLoopCommonModes];
+    }
+}
+- (void)stopAnimation  { [_timer invalidate]; _timer = nil; [super stopAnimation]; }
+
+static int zcmp(void *ctx, const void *a, const void *b) {   // far (larger z) first
+    const Stream *s = (const Stream *)ctx;
+    double za = s[*(const int*)a].z, zb = s[*(const int*)b].z;
+    return (za < zb) - (za > zb);
+}
 
 - (void)animateOneFrame {
-    static int _al=0; if(!_al++) NSLog(@"[MatrixSaver] animateOneFrame first");
     for (int i = 0; i < NSTREAMS; i++) {
         Stream *s = &_streams[i];
         s->z += s->vz;
@@ -113,7 +156,6 @@ static double frand(double a, double b) { return a + (b - a) * (arc4random_unifo
 }
 
 - (void)drawRect:(NSRect)rect {
-    static int _dl=0; if(!_dl++) NSLog(@"[MatrixSaver] drawRect first bounds=%@", NSStringFromRect(self.bounds));
     [[NSColor blackColor] setFill];
     NSRectFill(rect);
 
@@ -121,15 +163,10 @@ static double frand(double a, double b) { return a + (b - a) * (arc4random_unifo
     double cx = W * 0.5, cy = H * 0.5;
     double F = W * 0.82;                        // focal length
 
-    // draw far streams first for correct depth overlap
-    int *order = malloc(sizeof(int) * NSTREAMS);
-    for (int i = 0; i < NSTREAMS; i++) order[i] = i;
-    for (int a = 0; a < NSTREAMS - 1; a++)      // simple insertion by z desc
-        for (int b = a + 1; b < NSTREAMS; b++)
-            if (_streams[order[b]].z > _streams[order[a]].z) { int t = order[a]; order[a] = order[b]; order[b] = t; }
+    qsort_r(_order, NSTREAMS, sizeof(int), _streams, zcmp);   // back-to-front, no alloc
 
     for (int oi = 0; oi < NSTREAMS; oi++) {
-        Stream *s = &_streams[order[oi]];
+        Stream *s = &_streams[_order[oi]];
         if (s->z <= 0.15) continue;
         double depthAlpha = (_zFar - s->z) / (_zFar - _zNear);
         if (depthAlpha < 0.04) continue;
@@ -150,13 +187,12 @@ static double frand(double a, double b) { return a + (b - a) * (arc4random_unifo
             a = depthAlpha * (k == 0 ? 1.0 : 0.92);
 
             NSFont *font = [self fontForSize:(int)(size)];
+            double half = [self halfAdvanceForSize:(int)(size) font:font];
             NSDictionary *attr = @{ NSFontAttributeName: font,
                                     NSForegroundColorAttributeName:[NSColor colorWithRed:r green:g blue:b alpha:a] };
             NSString *gl = _glyphs[s->glyph[k]];
-            NSSize gs = [gl sizeWithAttributes:attr];
-            [gl drawAtPoint:NSMakePoint(sx - gs.width * 0.5, sy - gs.height * 0.5) withAttributes:attr];
+            [gl drawAtPoint:NSMakePoint(sx - half, sy - size * 0.5) withAttributes:attr];
         }
     }
-    free(order);
 }
 @end
