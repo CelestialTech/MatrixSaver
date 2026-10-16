@@ -42,6 +42,7 @@ typedef struct {
     double  _cellH;      // world height of one glyph cell
     double  _zNear, _zFar;
     NSTimer *_timer;     // self-driven (SSENeedsAnimationTimer=false)
+    BOOL _wantAnim;      // controller asked us to animate
     BOOL _preview;
 }
 
@@ -122,16 +123,26 @@ static double frand(double a, double b) { return a + (b - a) * (arc4random_unifo
     return _advCache[sz];
 }
 
-- (void)startAnimation {
-    [super startAnimation];
-    if (!_timer) {
+- (void)startAnimation { [super startAnimation]; _wantAnim = YES; [self syncTimer]; }
+- (void)stopAnimation  { _wantAnim = NO; [self syncTimer]; [super stopAnimation]; }
+
+// The timer runs ONLY while the view is both wanted-animating AND actually in a window.
+// This is what keeps the CoreGraphics path honest: an offscreen thumbnail snapshot draws
+// once without a spinning timer, and a churned/accumulated controller whose view was
+// never placed on-screen (Tahoe instance bug) burns zero CPU. On DIMAS's 2x Retina panel
+// a stray CG timer is ~4x the cost it is on PaiMei's 1x 1080p, so this gate matters.
+- (void)syncTimer {
+    BOOL shouldRun = (_wantAnim && self.window != nil);
+    if (shouldRun && !_timer) {
         _timer = [NSTimer scheduledTimerWithTimeInterval:1.0/30.0 target:self
                     selector:@selector(animateOneFrame) userInfo:nil repeats:YES];
         _timer.tolerance = 1.0/120.0;                       // let the OS coalesce a little
         [[NSRunLoop currentRunLoop] addTimer:_timer forMode:NSRunLoopCommonModes];
+    } else if (!shouldRun && _timer) {
+        [_timer invalidate]; _timer = nil;
     }
 }
-- (void)stopAnimation  { [_timer invalidate]; _timer = nil; [super stopAnimation]; }
+- (void)viewDidMoveToWindow { [super viewDidMoveToWindow]; [self syncTimer]; }
 
 static int zcmp(void *ctx, const void *a, const void *b) {   // far (larger z) first
     const Stream *s = (const Stream *)ctx;

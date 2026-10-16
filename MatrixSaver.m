@@ -44,15 +44,20 @@
 @end
 
 // ---------------------------------------------------------------------------
-// Process-wide Monroe cache. Loading the Matrix.saver bundle (a dylib map) and
-// standing up a Metal view are the only expensive operations in this extension;
-// doing them per-instance under Tahoe's controller churn is what burned the CPU.
-// Both are done at most once per process and the live view is re-parented.
+// Monroe hosting. The one expensive operation is loading the Matrix.saver BUNDLE
+// (a dylib map — the DYLD "unnest" memory growth + most of the CPU). Under Tahoe's
+// controller churn the old code reloaded that bundle on EVERY on-screen appearance
+// (85 reloads / 12 min on DIMAS). So we load the bundle's principal class exactly
+// ONCE per process and cache it; each on-screen controller still gets its OWN Monroe
+// Metal VIEW (GPU, resolution-independent → cheap even on the Air's 2x Retina panel,
+// which is why PaiMei's 1080p Metal path was always smooth). Per-controller views —
+// instead of one shared view bounced between controllers — keep every visible host
+// rendering Monroe (no black preview) and are torn down when they leave the screen so
+// accumulated instances cost nothing.
 // ---------------------------------------------------------------------------
-static Class        gMonroeClass   = Nil;   // Matrix.saver principal class (loaded once)
-static BOOL         gMonroeTried   = NO;     // bundle load attempted (success or fail)
-static ScreenSaverView *gMonroeView = nil;   // the single live Monroe Metal view
-static id           gActivity      = nil;    // process-global anti-App-Nap assertion
+static Class gMonroeClass = Nil;   // Matrix.saver principal class (loaded once)
+static BOOL  gMonroeTried = NO;    // bundle load attempted (success or fail), cached
+static id    gActivity    = nil;   // process-global anti-App-Nap assertion
 
 // Keep the render timer un-throttled for the whole process lifetime. WallpaperAgent
 // otherwise lets runningboardd park the extension at AppNap timer Tier5 on battery
@@ -66,7 +71,7 @@ static void MXBeginActivityOnce(void) {
 }
 
 // Load Monroe's principal class exactly once, caching success OR failure so a broken
-// bundle is not retried on every instance.
+// bundle is not retried on every instance. This is the DYLD map that must not repeat.
 static Class MXMonroeClass(Class selfClass) {
     if (gMonroeTried) return gMonroeClass;
     gMonroeTried = YES;
@@ -80,24 +85,11 @@ static Class MXMonroeClass(Class selfClass) {
     return gMonroeClass;
 }
 
-// Return the single process-wide Monroe view, creating it the first time only. Its
-// animation is started once and never stopped, so re-parenting is seamless.
-static ScreenSaverView *MXMonroeView(Class selfClass, NSRect frame) {
-    Class c = MXMonroeClass(selfClass);
-    if (!c) return nil;
-    if (!gMonroeView) {
-        gMonroeView = [[c alloc] initWithFrame:frame isPreview:NO];
-        if (gMonroeView) { @try { [gMonroeView startAnimation]; } @catch(...){} }
-        MXLOG(@"created single Monroe view %@", gMonroeView);
-    }
-    return gMonroeView;
-}
-
 @interface MatrixViewController : ScreenSaverViewController
 @end
 @implementation MatrixViewController {
-    MatrixView *_cg;        // cheap CoreGraphics rain — offscreen thumbnail path only
-    BOOL        _ownsMonroe; // this controller currently hosts the shared Monroe view
+    MatrixView      *_cg;       // cheap CoreGraphics rain — offscreen thumbnail path only
+    ScreenSaverView *_monroe;   // this controller's own Monroe Metal view (on-screen)
 }
 - (void)loadView {
     self.view = [[NSView alloc] initWithFrame:NSMakeRect(0,0,1920,1080)];
@@ -105,13 +97,14 @@ static ScreenSaverView *MXMonroeView(Class selfClass, NSRect frame) {
     MXBeginActivityOnce();
 }
 
-// Default (also the offscreen thumbnail path): green CoreGraphics rain. Created lazily
-// and only once per controller; its own NSTimer drives it (SSENeedsAnimationTimer=false).
+// Default (also the offscreen thumbnail path): green CoreGraphics rain. Created lazily;
+// its own NSTimer drives it only while on-window (SSENeedsAnimationTimer=false). Once
+// Monroe is installed (on-screen) this is gone and CG never renders full-size.
 - (void)viewDidLayout {
     [super viewDidLayout];
     NSRect b = self.view.bounds;
     if (b.size.width < 2 || b.size.height < 2) return;
-    if (_ownsMonroe && gMonroeView) { gMonroeView.frame = b; return; }
+    if (_monroe) { _monroe.frame = b; return; }
     if (!_cg) {
         _cg = [[MatrixView alloc] initWithFrame:b isPreview:YES];
         _cg.autoresizingMask = NSViewNotSizable;
@@ -129,38 +122,38 @@ static ScreenSaverView *MXMonroeView(Class selfClass, NSRect frame) {
 // Matrix. It is NEVER called for the offscreen thumbnail snapshot, which keeps the safe
 // CG render (Monroe's Metal cannot draw into that offscreen context).
 //
-// We re-parent the ONE shared Monroe view here instead of building a new one. The newest
-// on-screen controller wins the view; that is exactly the behaviour the idle screensaver
-// needs (a single scene) and it makes the host's instance churn free.
+// Each on-screen controller gets its OWN Monroe view (class is cached, so no bundle
+// reload) and drops the CoreGraphics fallback. GPU Metal is cheap and resolution-
+// independent, so this renders Monroe on-screen on the Air's Retina panel just as it
+// does on PaiMei — the CoreGraphics path never runs full-size.
 - (void)viewDidAppear {
     [super viewDidAppear];
-    ScreenSaverView *m = MXMonroeView([self class], self.view.bounds);
-    if (!m) return;                 // Monroe unavailable: keep the CG fallback
+    if (_monroe) return;
+    Class c = MXMonroeClass([self class]);
+    if (!c) return;                 // Monroe unavailable: keep the CG fallback
+    ScreenSaverView *m = [[c alloc] initWithFrame:self.view.bounds isPreview:NO];
+    if (!m) { MXLOG(@"Monroe alloc returned nil"); return; }
     if (_cg) { [_cg stopAnimation]; [_cg removeFromSuperview]; _cg = nil; }
-    if (m.superview != self.view) {
-        [m removeFromSuperview];
-        m.frame = self.view.bounds;
-        m.autoresizingMask = NSViewNotSizable;
-        [self.view addSubview:m];
-    }
-    _ownsMonroe = YES;
+    m.frame = self.view.bounds;
+    m.autoresizingMask = NSViewNotSizable;
+    [self.view addSubview:m];
+    @try { [m startAnimation]; } @catch(...){}
+    _monroe = m;
     NSWindow *w = self.view.window;
-    MXLOG(@"viewDidAppear level=%ld -> re-parented shared Monroe", w ? (long)w.level : -999);
+    MXLOG(@"viewDidAppear level=%ld -> Monroe Metal (own view)", w ? (long)w.level : -999);
 }
 
-// When this controller leaves the screen, drop its claim on the shared Monroe view and
-// silence its CG timer so off-screen (accumulated) instances cost nothing. The Monroe
-// view itself keeps animating, ready for the next on-screen controller.
+// When this controller leaves the screen, tear down its Monroe view and silence the CG
+// timer so accumulated (Tahoe-churned) instances cost nothing — no lingering Metal
+// contexts, no lingering CoreGraphics timers.
 - (void)viewDidDisappear {
     [super viewDidDisappear];
-    if (_ownsMonroe && gMonroeView && gMonroeView.superview == self.view) {
-        [gMonroeView removeFromSuperview];
-    }
-    _ownsMonroe = NO;
+    if (_monroe) { @try { [_monroe stopAnimation]; } @catch(...){} [_monroe removeFromSuperview]; _monroe = nil; }
     if (_cg) { [_cg stopAnimation]; }
 }
 
 - (void)dealloc {
+    if (_monroe) { @try { [_monroe stopAnimation]; } @catch(...){} [_monroe removeFromSuperview]; }
     if (_cg) { [_cg stopAnimation]; [_cg removeFromSuperview]; }
 }
 @end
