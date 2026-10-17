@@ -10,10 +10,16 @@
 #                                  cache, removes ~/Applications/MatrixSaver.app, forgets the
 #                                  install receipt, reloads WallpaperAgent).
 #
+# Both postinstall scripts are CONTEXT-AWARE: they work when run as root (the GUI double-click /
+# `installer -target /` path, via installd → launchctl asuser + sudo -u) AND when run as the user
+# (the `installer -pkg … -target CurrentUserHomeDirectory` path, which needs no admin password and
+# is how the DIMAS lifecycle test runs). The payload source is resolved from the installer-supplied
+# destination, not a hardcoded /Library path, so a user-domain install finds its own payload.
+#
 # OUR code is signed with appex.entitlements (app-sandbox + disable-library-validation +
-# mach-lookup for CARenderServer/CoreDisplay/ViewBridge — the set Monroe needs to load and
-# render Metal under the hardened runtime). Monroe's binary is NEVER re-signed; the md5 is
-# asserted unchanged across signing (re-signing it makes Metal render black).
+# mach-lookup for CARenderServer/CoreDisplay/ViewBridge — the set Monroe needs to load and render
+# Metal under the hardened runtime). Monroe's binary is NEVER re-signed; the md5 is asserted
+# unchanged across signing (re-signing it makes Metal render black).
 set -euo pipefail
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD="$SRC/build"; APP="$BUILD/MatrixSaver.app"
@@ -47,7 +53,25 @@ A=$(md5 -q "$SAVER/Contents/MacOS/"* | head -1); echo "Monroe md5 after  = $A"
 [ "$B" = "$A" ] || { echo "FATAL_SAVER_CHANGED"; exit 9; }
 codesign --verify --deep --strict "$APP" && echo "app signature OK"
 
-# --- shared install-configuration scripts (install pkg postinstall uses these) ----------------
+# A shell fragment shared by both postinstall scripts: resolve the target user/home and define
+# asuser()/runuser() that drop to that user when root, or run directly when already that user.
+read -r -d '' CTX_HELPER <<'CTX' || true
+if [ "$(/usr/bin/id -u)" = "0" ]; then
+    CU=$(/usr/bin/stat -f%Su /dev/console)
+    CUID=$(/usr/bin/id -u "$CU")
+    UH=$(/usr/bin/dscl . -read /Users/"$CU" NFSHomeDirectory 2>/dev/null | /usr/bin/awk '{print $2}')
+    asuser()  { /bin/launchctl asuser "$CUID" /usr/bin/sudo -u "$CU" "$@"; }   # into the user's GUI session
+    runuser() { /usr/bin/sudo -u "$CU" "$@"; }
+    AMROOT=1
+else
+    CU=$(/usr/bin/whoami); CUID=$(/usr/bin/id -u); UH="$HOME"
+    asuser()  { "$@"; }
+    runuser() { "$@"; }
+    AMROOT=0
+fi
+CTX
+
+# --- install-configuration scripts (install pkg postinstall uses these) -----------------------
 mk_activate_choice() {  # $1 = dest scripts dir ; selects Matrix via the wallpaper Choice
 cat > "$1/activate_choice.py" <<'ACTIVATE'
 import plistlib, sys, os
@@ -69,6 +93,22 @@ def patch(o):
         for v in o: patch(v)
 patch(d); plistlib.dump(d,open(idx,"wb")); print("patched",n)
 ACTIVATE
+}
+mk_read_choice() {  # $1 = dest scripts dir ; exit 0 iff the wallpaper Choice references our appex
+cat > "$1/read_choice.py" <<'READ'
+import plistlib, os, sys
+p=os.path.expanduser("~/Library/Application Support/com.apple.wallpaper/Store/Index.plist")
+if not os.path.exists(p): sys.exit(1)
+d=plistlib.load(open(p,"rb")); f=[]
+def w(o):
+    if isinstance(o,dict):
+        [w(v) for v in o.values()]
+    elif isinstance(o,list):
+        [w(v) for v in o]
+    elif isinstance(o,bytes) and b"MatrixSaver.appex" in o: f.append(1)
+    elif isinstance(o,str) and "MatrixSaver.appex" in o: f.append(1)
+w(d); sys.exit(0 if f else 1)
+READ
 }
 mk_tile_fix() {  # $1 = dest scripts dir ; locks the green Monroe thumbnail over the swirl tile
 cat > "$1/matrix_tile_fix.sh" <<'TILEFIX'
@@ -99,29 +139,49 @@ ditto "$APP" "$STAGE/Library/Application Support/MatrixSaver/MatrixSaver.app"   
 /usr/sbin/dot_clean -m "$STAGE" 2>/dev/null || true                            # strip any AppleDouble
 cp "$SRC/pkgbits/swirl_214.png" "$SRC/pkgbits/swirl_180.png" "$SCRIPTS/"
 mk_activate_choice "$SCRIPTS"
+mk_read_choice "$SCRIPTS"
 mk_tile_fix "$SCRIPTS"
 
-cat > "$SCRIPTS/postinstall" <<'POST'
+{
+cat <<POSTHEAD
 #!/bin/bash
-SELF="$(cd "$(dirname "$0")" && pwd)"
-CU=$(/usr/bin/stat -f%Su /dev/console)
-UH=$(/usr/bin/dscl . -read /Users/"$CU" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
-CUID=$(/usr/bin/id -u "$CU")
-DEST="$UH/Applications/MatrixSaver.app"; AX="$DEST/Contents/PlugIns/MatrixSaver.appex"
-# clean prior install (idempotent upgrade) then lay down fresh
+SELF="\$(cd "\$(dirname "\$0")" && pwd)"
+$CTX_HELPER
+# Resolve the staged payload from the installer-supplied destination (\$3 volume, \$2 location),
+# so a user-domain install (base=\$HOME) finds its own copy rather than a hardcoded /Library path.
+STAGED=""
+for BASE in "\$3" "\$2" "" ; do
+  C="\$BASE/Library/Application Support/MatrixSaver/MatrixSaver.app"
+  [ -d "\$C" ] && { STAGED="\$C"; break; }
+done
+[ -n "\$STAGED" ] || { echo "postinstall: staged payload not found"; exit 1; }
+DEST="\$UH/Applications/MatrixSaver.app"; AX="\$DEST/Contents/PlugIns/MatrixSaver.appex"
 /bin/rm -rf /Applications/MatrixSaver.app 2>/dev/null || true
-/bin/mkdir -p "$UH/Applications"; /bin/rm -rf "$DEST"
-/usr/bin/ditto "/Library/Application Support/MatrixSaver/MatrixSaver.app" "$DEST"
-/usr/sbin/chown -R "$CU":staff "$UH/Applications/MatrixSaver.app"
-/bin/rm -rf "/Library/Application Support/MatrixSaver" 2>/dev/null || true
+/bin/mkdir -p "\$UH/Applications"; /bin/rm -rf "\$DEST"
+/usr/bin/ditto "\$STAGED" "\$DEST"
+[ "\$AMROOT" = "1" ] && /usr/sbin/chown -R "\$CU":staff "\$UH/Applications/MatrixSaver.app" || true
+/bin/rm -rf "\$(dirname "\$STAGED")" 2>/dev/null || true
 LSREG=/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister
-"$LSREG" -f "$DEST" || true
-/bin/launchctl asuser "$CUID" /usr/bin/pluginkit -a "$AX" 2>/dev/null || true
-/bin/launchctl asuser "$CUID" /usr/bin/sudo -u "$CU" /usr/bin/python3 "$SELF/activate_choice.py" "$AX" 2>/dev/null || true
-/bin/launchctl asuser "$CUID" /usr/bin/sudo -u "$CU" /bin/bash "$SELF/matrix_tile_fix.sh" "$SELF" 2>/dev/null || true
-/bin/launchctl asuser "$CUID" /usr/bin/killall WallpaperAgent 2>/dev/null || true
+"\$LSREG" -f "\$DEST" || true
+# Register the appex, RETRYING until pkd confirms it. A single pluginkit -a on a freshly
+# ditto'd bundle frequently does not take inside the installer transaction (registration is
+# async), which left the saver unregistered and any Choice referencing an unknown appex (then
+# dropped by WallpaperAgent on reload). Re-run pluginkit -a while polling pluginkit -m, ~10s.
+reg() { asuser /usr/bin/pluginkit -m -i io.celestialtech.MatrixSaver.saver 2>/dev/null | /usr/bin/grep -c Matrix; }
+asuser /usr/bin/pluginkit -a "\$AX" 2>/dev/null || true
+for _i in \$(/usr/bin/seq 1 20); do [ "\$(reg)" != "0" ] && break; /bin/sleep 0.5; asuser /usr/bin/pluginkit -a "\$AX" 2>/dev/null || true; done
+runuser /bin/bash "\$SELF/matrix_tile_fix.sh" "\$SELF" 2>/dev/null || true
+# Select Matrix and reload the agent, then VERIFY the Choice survived (a Choice whose appex was
+# not yet registered gets dropped on reload); re-apply up to 5x until it sticks.
+for _i in \$(/usr/bin/seq 1 5); do
+  runuser /usr/bin/python3 "\$SELF/activate_choice.py" "\$AX" 2>/dev/null || true
+  asuser /usr/bin/killall WallpaperAgent 2>/dev/null || true
+  /bin/sleep 1
+  runuser /usr/bin/python3 "\$SELF/read_choice.py" 2>/dev/null && break
+done
 exit 0
-POST
+POSTHEAD
+} > "$SCRIPTS/postinstall"
 chmod +x "$SCRIPTS/postinstall" "$SCRIPTS/matrix_tile_fix.sh"
 
 echo "=== component plist: mark the app NON-relocatable (force install path) ==="
@@ -155,28 +215,23 @@ def patch(o):
 patch(d); plistlib.dump(d,open(idx,"wb")); print("cleared",n)
 DEACT
 
-cat > "$USCRIPTS/postinstall" <<'UPOST'
+{
+cat <<UPOSTHEAD
 #!/bin/bash
-SELF="$(cd "$(dirname "$0")" && pwd)"
-CU=$(/usr/bin/stat -f%Su /dev/console)
-UH=$(/usr/bin/dscl . -read /Users/"$CU" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
-CUID=$(/usr/bin/id -u "$CU")
-DEST="$UH/Applications/MatrixSaver.app"; AX="$DEST/Contents/PlugIns/MatrixSaver.appex"
-# deregister the screensaver extension
-[ -d "$AX" ] && /bin/launchctl asuser "$CUID" /usr/bin/pluginkit -r "$AX" 2>/dev/null || true
-# clear the Matrix wallpaper Choice (idle screen saver falls back to default)
-/bin/launchctl asuser "$CUID" /usr/bin/sudo -u "$CU" /usr/bin/python3 "$SELF/deactivate_choice.py" 2>/dev/null || true
-# drop the module pref we set
-/bin/launchctl asuser "$CUID" /usr/bin/sudo -u "$CU" /usr/bin/defaults -currentHost delete com.apple.screensaver moduleDict 2>/dev/null || true
-# unlock + clear the (locked) legacy thumbnail cache so tiles regenerate clean
-T="$(/bin/launchctl asuser "$CUID" /usr/bin/sudo -u "$CU" /usr/bin/getconf DARWIN_USER_CACHE_DIR)com.apple.wallpaper.extension.legacy/com.apple.wallpaper.legacy.thumbnails"
-[ -d "$T" ] && { /usr/bin/chflags -R nouchg "$T" 2>/dev/null; /bin/rm -f "$T"/*.png 2>/dev/null; } || true
-# remove the app, any stray copies, and the install receipt
-/bin/rm -rf "$DEST" /Applications/MatrixSaver.app "/Library/Application Support/MatrixSaver" 2>/dev/null || true
+SELF="\$(cd "\$(dirname "\$0")" && pwd)"
+$CTX_HELPER
+DEST="\$UH/Applications/MatrixSaver.app"; AX="\$DEST/Contents/PlugIns/MatrixSaver.appex"
+[ -d "\$AX" ] && asuser /usr/bin/pluginkit -r "\$AX" 2>/dev/null || true
+runuser /usr/bin/python3 "\$SELF/deactivate_choice.py" 2>/dev/null || true
+runuser /usr/bin/defaults -currentHost delete com.apple.screensaver moduleDict 2>/dev/null || true
+T="\$(runuser /usr/bin/getconf DARWIN_USER_CACHE_DIR)com.apple.wallpaper.extension.legacy/com.apple.wallpaper.legacy.thumbnails"
+[ -d "\$T" ] && { /usr/bin/chflags -R nouchg "\$T" 2>/dev/null; /bin/rm -f "\$T"/*.png 2>/dev/null; } || true
+/bin/rm -rf "\$DEST" /Applications/MatrixSaver.app "/Library/Application Support/MatrixSaver" 2>/dev/null || true
 /usr/sbin/pkgutil --forget io.celestialtech.MatrixSaver 2>/dev/null || true
-/bin/launchctl asuser "$CUID" /usr/bin/killall WallpaperAgent 2>/dev/null || true
+asuser /usr/bin/killall WallpaperAgent 2>/dev/null || true
 exit 0
-UPOST
+UPOSTHEAD
+} > "$USCRIPTS/postinstall"
 chmod +x "$USCRIPTS/postinstall"
 
 echo "=== build + sign UNINSTALL .pkg ==="
