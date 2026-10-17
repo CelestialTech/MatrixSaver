@@ -16,9 +16,10 @@
 MatrixSaver is a native green digital-rain screensaver for macOS, built as a modern
 ExtensionKit **`.appex`** — the same first-class format Apple's own screensavers
 (Flurry, Drift, Computer Name…) use. That is what lets it register and run cleanly on
-**macOS 26/27**, where the legacy `.saver` plug-in path has become unreliable. Full-screen
-it drives **Monroe Williams' Metal "Matrix"** renderer; for the System Settings preview and
-the picker thumbnail it uses an original CoreGraphics renderer.
+**macOS 26/27**, where the legacy `.saver` plug-in path has become unreliable. On-screen it
+drives **Monroe Williams' Metal "Matrix"** renderer — which is resolution-independent and
+cheap on every display; an original CoreGraphics renderer is kept strictly for the picker
+thumbnail (which Monroe's Metal cannot draw) and as a fallback if Monroe fails to load.
 
 ## Contents
 
@@ -31,20 +32,26 @@ the picker thumbnail it uses an original CoreGraphics renderer.
 ## Install
 
 Download the notarized installer from the
-[**latest release**](https://github.com/CelestialTech/MatrixSaver/releases/latest):
+[**latest release**](https://github.com/CelestialTech/MatrixSaver/releases/latest) and run it:
 
-1. Open **`MatrixSaver-1.2.dmg`**.
-2. Run the enclosed **`MatrixSaver.pkg`** — it installs `MatrixSaver.app` into
-   `/Applications` and the screensaver registers automatically.
-   *(You can also download and run `MatrixSaver.pkg` directly, without the DMG.)*
-3. Open **System Settings → Screen Saver**, and pick **Matrix**.
+1. Run **`MatrixSaver.pkg`** (double-click).
+2. That is all. The installer is **self-configuring** — it installs `MatrixSaver.app` into your
+   **`~/Applications`**, registers the extension, **selects Matrix** as the screen saver, locks
+   the green Matrix tile over the picker's generic placeholder, and reloads the wallpaper agent.
+3. *(Optional)* Open **System Settings → Screen Saver** to confirm **Matrix** is selected.
 
-Signed and notarized, so it installs without any Gatekeeper prompt.
+Signed and notarized, so it installs with no Gatekeeper prompt and nothing is quarantined.
+
+> **Why `~/Applications` and not `/Applications`?** The wallpaper store resolves the saver by an
+> absolute path, and the macOS 26/27 picker writes its per-user caches against that path. A single
+> per-user copy at `~/Applications` keeps the store reference, the `pluginkit` registration, and the
+> thumbnail cache pointing at the same bundle — a split between `/Applications` and `~/Applications`
+> is exactly what produces a dead reference and a placeholder tile.
 
 ## Requirements
 
 - **macOS 14–27** (Sonoma through the macOS 27 line).
-- **Apple Silicon (arm64).** The release binary and `build.sh` compile `-arch arm64` only;
+- **Apple Silicon (arm64).** The release binary and the build scripts compile `-arch arm64` only;
   Intel Macs need a universal rebuild.
 - To build from source: Xcode Command Line Tools (`clang`), and Monroe Williams'
   `Matrix.saver` (see [Build from source](#build-from-source) — it is not bundled in this repo).
@@ -56,7 +63,7 @@ Three thin classes, reverse-engineered from Apple's ObjC `Computer Name.appex`:
 | Class | Base (from `ScreenSaver.framework`) | Role |
 |---|---|---|
 | `MatrixExtension` | `ScreenSaverExtension` | principal class (intentionally minimal) |
-| `MatrixViewController` | `ScreenSaverViewController` | selects the renderer by context (below) and vends the view |
+| `MatrixViewController` | `ScreenSaverViewController` | owns the Monroe Metal view on-screen; falls back to CoreGraphics (below) |
 | `MatrixView` | `ScreenSaverView` | the CoreGraphics rain: `initWithFrame:isPreview:`, `animateOneFrame`, `drawRect:` |
 
 `ScreenSaverExtension` and `ScreenSaverViewController` have no public headers but are
@@ -64,26 +71,42 @@ exported by `ScreenSaver.framework` (its `.tbd` lists them) — declare them loc
 (`@interface X : NSObject` / `: NSViewController`) and link `-framework ScreenSaver`.
 `ScreenSaverView` is public (`<ScreenSaver/ScreenSaver.h>`).
 
-### Renderer strategy: CoreGraphics offscreen, Monroe's Metal on-screen
+### Renderer strategy: Monroe's Metal on-screen, CoreGraphics for the thumbnail only
 
-The full-screen renderer is **Monroe Williams' Metal "Matrix"**, loaded at runtime from the
-bundled `Contents/Resources/Matrix.saver`. Monroe's `MTKView`, however, cannot draw into the
-offscreen bitmap context the system uses for thumbnail snapshots — it crashes or renders
-blank. `MatrixViewController` therefore selects the renderer by *context*, not by size:
+The on-screen renderer is **Monroe Williams' Metal "Matrix"**, loaded at runtime from the
+bundled `Contents/Resources/Matrix.saver`. Monroe's `MTKView` cannot draw into the offscreen
+bitmap context the system uses for thumbnail snapshots — it renders blank there — so the
+CoreGraphics `MatrixView` exists to cover that one case (and as a fallback if Monroe's bundle
+fails to load). `MatrixViewController` therefore builds Monroe's view for any on-screen host and
+keeps CoreGraphics off the on-screen path entirely:
 
-- **`viewDidLayout`** always builds the CoreGraphics `MatrixView` (green; it renders in any
-  context, including the offscreen thumbnail snapshot that Monroe cannot).
-- **`viewDidAppear`** fires only for an on-screen host — never for the offscreen snapshot —
-  and swaps in Monroe's Metal view.
+- **`viewDidAppear`** fires only for an on-screen host — never for the offscreen snapshot — and
+  adds a Monroe Metal view sized to the host. Each controller renders its **own** Monroe view;
+  the Monroe *bundle class* is loaded **once per process** and cached, so no host churn triggers a
+  DYLD reload.
+- **`viewDidDisappear`** tears that Monroe view back down.
+- **`MatrixView`** (CoreGraphics) drives its own `NSTimer` and gates it to `window != nil`
+  (`viewDidMoveToWindow`), so an offscreen thumbnail snapshot draws a single frame with no running
+  timer, and a churned/accumulated controller that was never placed on-screen burns zero CPU.
+  `SSENeedsAnimationTimer` is therefore `false`.
+
+**Why this split matters (the PaiMei-vs-DIMAS story).** Monroe's Metal renderer is
+GPU-/resolution-independent: measured at **3–4% CPU rendering full-screen even on a 2× Retina
+MacBook Air (2560×1664)**. The CoreGraphics renderer, by contrast, is CPU-bound glyph
+rasterization (`CGContextShowGlyphsWithAdvances`) whose cost scales with the pixel count — roughly
+**4× heavier on a 2× Retina laptop than on a 1× 1080p desktop**. An earlier version let the
+CoreGraphics path run on-screen; it was invisible on a 1× Mac Studio but spiked to 34–52% CPU and
+flickered on the 2× Air. The fix was not to optimize CoreGraphics — it was to keep Monroe's Metal
+on-screen and confine CoreGraphics to the offscreen thumbnail. (The CoreGraphics path was also
+rewritten to drop a per-frame `malloc` and an O(n²) depth sort in favour of a persistent buffer +
+`qsort` with cached glyph metrics, so even the thumbnail draw does no quadratic work.)
 
 **A non-obvious macOS 26/27 finding:** the System Settings *popover preview* and the *real
-full-screen idle run* are the **same wallpaper-agent render path** — both on-screen, both at
-the same observed window level (`-2147483625`), indistinguishable from inside the extension by
-size, level, or occlusion. You therefore *cannot* run CoreGraphics in the preview and Monroe
-full-screen by inspecting the window; both are on-screen, so both get Monroe. The result is
-Monroe's green rain full-screen plus a live rain preview (the preview reads blue-tinted only
-because of the popover's translucent material). Only the offscreen thumbnail stays on
-CoreGraphics.
+full-screen idle run* are the **same wallpaper-agent render path** — both on-screen, both at the
+same observed window level (`-2147483625`), indistinguishable from inside the extension by size,
+level, or occlusion. Both therefore get Monroe. The preview reads blue-tinted only because of the
+popover's translucent material; the real saver is green. Only the offscreen thumbnail snapshot
+stays on CoreGraphics.
 
 ## Building it as a modern .appex
 
@@ -98,7 +121,7 @@ NSExtension = {
 }
 ScreenSaverViewControllerClass = MatrixViewController
 SSEHasConfigureSheet   = false
-SSENeedsAnimationTimer = true
+SSENeedsAnimationTimer = false    # MatrixView drives its own window-gated NSTimer
 ```
 
 ### The extension must be sandboxed
@@ -116,7 +139,9 @@ com.apple.security.temporary-exception.mach-lookup.global-name =
 ```
 
 For distribution, sign with a **Developer ID** and the hardened runtime (`-o runtime`), applying
-those entitlements to the extension, and sign the appex **before** the host app.
+those entitlements to the extension, and sign the appex **before** the host app. Sign only **your
+own** code: Monroe's `Matrix.saver` binary must be shipped byte-for-byte — re-signing it makes his
+Metal renderer draw black.
 
 ### Install location matters
 
@@ -124,13 +149,13 @@ The `.appex` ships inside a host app: `MatrixSaver.app/Contents/PlugIns/MatrixSa
 Install it to **one** location and make sure the wallpaper store's bookmark resolves to it.
 A mismatch fails silently: if the copy registered with `pluginkit` is not the copy the store's
 `Idle` config points to, the reference is dead — the `screenSaver-` cache directory gets an
-empty suffix and the picker shows a placeholder tile. The release `.pkg` installs to
-`/Applications`; keep a single copy there and don't leave stragglers in `~/Applications` or
-DerivedData. Register and verify:
+empty suffix and the picker shows a placeholder tile. The release `.pkg` installs a single
+per-user copy to **`~/Applications`**; don't leave stragglers in `/Applications` or DerivedData.
+Register and verify:
 
 ```bash
-lsregister -f /Applications/MatrixSaver.app
-pluginkit -a /Applications/MatrixSaver.app/Contents/PlugIns/MatrixSaver.appex
+lsregister -f ~/Applications/MatrixSaver.app
+pluginkit -a ~/Applications/MatrixSaver.app/Contents/PlugIns/MatrixSaver.appex
 pluginkit -m -i io.celestialtech.MatrixSaver.saver   # lists it, SDK = com.apple.screensaver
 ```
 
@@ -138,44 +163,48 @@ pluginkit -m -i io.celestialtech.MatrixSaver.saver   # lists it, SDK = com.apple
 
 > **Monroe Williams' `Matrix.saver` is not included in this repository.** Obtain it (see
 > [Credits](#credits--references)) and place it at
-> `MatrixSaver.app/Contents/PlugIns/MatrixSaver.appex/Contents/Resources/Matrix.saver`.
-> Without it the full-screen renderer will not load and you get the CoreGraphics rain only.
+> `Matrix.saver/` in the repo root; the build scripts stage it into the appex at
+> `…/MatrixSaver.appex/Contents/Resources/Matrix.saver`.
+> Without it the on-screen renderer will not load and you get the CoreGraphics rain only.
+
+Two builders ship in the repo:
 
 ```bash
-./build.sh    # compiles the arm64 binaries (min macOS 14), assembles the bundles,
-              # ad-hoc signs, installs to ~/Applications, and registers via pluginkit
+./build.sh                 # ad-hoc, local arm64 build: assembles the bundles, ad-hoc signs,
+                           # installs to ~/Applications, and registers via pluginkit
+./build-pkg-notarize.sh    # the distributable: compiles arm64, signs ONLY your code
+                           # (asserts Monroe's md5 before and after), builds a self-configuring
+                           # Developer-ID .pkg, notarizes with notarytool, and staples
 ```
 
-`build.sh` produces an **ad-hoc, local** build. Two things it does *not* do, which a working
-and distributable build needs:
+`build.sh` produces an **ad-hoc, local** build. For a distributable artifact use
+`build-pkg-notarize.sh`, which additionally:
 
-1. **Stage `Matrix.saver`** into the appex's `Contents/Resources` (above).
-2. **Force Monroe's Metal renderer** — his saver defaults to an OpenGL path that renders black
-   on macOS 26/27. Select Metal via its per-host preference:
-   ```bash
-   defaults -currentHost write org.indirect.screensaver.Matrix renderer -int 0   # 0 = Metal, 1 = OpenGL
-   ```
-3. For distribution, **sign + notarize** (ad-hoc signing will not pass Gatekeeper, and an
-   unsandboxed appex will not bind):
-   ```bash
-   codesign -f -o runtime --entitlements appex.entitlements \
-     -s "Developer ID Application: …" MatrixSaver.app/Contents/PlugIns/MatrixSaver.appex
-   codesign -f -o runtime -s "Developer ID Application: …" MatrixSaver.app
-   # build a .pkg (Developer ID Installer), then:
-   xcrun notarytool submit MatrixSaver-1.2.dmg --keychain-profile <profile> --wait
-   xcrun stapler staple MatrixSaver-1.2.dmg
-   ```
+1. **Stages `Matrix.saver`** into the appex's `Contents/Resources` (above) and **asserts its md5 is
+   unchanged** before and after signing (a FATAL guard — re-signing Monroe's binary renders black).
+2. **Signs only your code** — the appex binary and bundle (with the sandbox entitlement) and the
+   host app — with `-o runtime --timestamp` Developer ID, then builds a **non-relocatable** `.pkg`
+   (`--component-plist` with `BundleIsRelocatable=false`) whose `postinstall` installs to
+   `~/Applications`, selects Matrix, runs the one-shot tile fix, and reloads `WallpaperAgent`.
+3. **Notarizes + staples** so the `.pkg` installs with no Gatekeeper prompt.
+
+> **Forcing Monroe's Metal renderer.** Monroe's saver historically defaulted to an OpenGL path that
+> renders black on macOS 26/27. Select Metal via its per-host preference if needed:
+> ```bash
+> defaults -currentHost write org.indirect.screensaver.Matrix renderer -int 0   # 0 = Metal, 1 = OpenGL
+> ```
 
 ## Headless activation (wallpaper store)
 
-Selecting it in System Settings is the normal path. To set it without the UI, write the
+The installer does this for you. To set it by hand without the UI, write the
 `com.apple.wallpaper` store at
 `~/Library/Application Support/com.apple.wallpaper/Store/Index.plist`. Set every `Idle` scope
 (`AllSpacesAndDisplays.Idle` and each `Displays[*].Idle`) to:
 
 ```python
 cfg = plistlib.dumps({"module": {"relative":
-      "file:///Applications/MatrixSaver.app/Contents/PlugIns/MatrixSaver.appex"}},
+      "file://" + os.path.expanduser(
+        "~/Applications/MatrixSaver.app/Contents/PlugIns/MatrixSaver.appex")}},
       fmt=plistlib.FMT_BINARY)
 idle = {"Content": {"Choices": [{"Configuration": cfg, "Files": [],
         "Provider": "com.apple.wallpaper.choice.screen-saver"}]},
@@ -183,22 +212,25 @@ idle = {"Content": {"Choices": [{"Configuration": cfg, "Files": [],
 ```
 
 then `killall WallpaperAgent`. The shape matches the PaperSaver library —
-`{module: {relative: <file:// URL>}}` with provider `com.apple.wallpaper.choice.screen-saver`;
-the same shape works for a legacy `.saver` by pointing `relative` at the `.saver`. Verify with
-`open -a ScreenSaverEngine` (it renders the rain full-screen).
+`{module: {relative: <file:// URL>}}` with provider `com.apple.wallpaper.choice.screen-saver`.
+Note that on macOS 26/27 the `com.apple.wallpaper.choice.screen-saver` provider is what selects
+the saver; the older `moduleDict` default is ignored. The real idle saver on 26/27 runs through
+`WallpaperAgent` (`ScreenSaverEngine` is a stub, and `open -a`/`osascript` do not force it
+full-screen); the full-screen idle saver is a lock-screen feature, so desktop idle no longer starts
+it automatically.
 
 ## Grid-tile thumbnail workaround (macOS 26/27)
 
 The large popover preview renders live and works (see
-[Renderer strategy](#renderer-strategy-coregraphics-offscreen-monroes-metal-on-screen)). The
-small **grid tile** does not: on macOS 26/27 the picker never renders a third-party saver for
+[Renderer strategy](#renderer-strategy-monroes-metal-on-screen-coregraphics-for-the-thumbnail-only)).
+The small **grid tile** does not: on macOS 26/27 the picker never renders a third-party saver for
 its tile — it routes the request through the legacy thumbnail generator, which cannot render a
 modern `.appex` and emits a generic **blue-swirl placeholder**. No cache-clear, version bump,
 or re-registration dislodges it, and `ScreenSaver.framework` exposes no thumbnail/poster hook.
 
-The workaround replaces the picker's cached tile PNGs with a static Matrix poster (Monroe ships
-one: `Matrix.saver/Contents/Resources/thumbnail.png`, green rain) and locks them so they can't
-be regenerated:
+The installer applies this automatically; by hand it replaces the picker's cached tile PNGs with a
+static Matrix poster (Monroe ships one: `Matrix.saver/Contents/Resources/thumbnail.png`, green rain)
+and locks them so they can't be regenerated:
 
 ```bash
 T="$(getconf DARWIN_USER_CACHE_DIR)com.apple.wallpaper.extension.legacy/com.apple.wallpaper.legacy.thumbnails"
@@ -211,27 +243,29 @@ chflags uchg "$T"/<matrix-hash>.png                # lock so the picker can't ov
 ```
 
 This is reversible (`chflags nouchg` + delete regenerates the swirl). Because it overwrites a
-system cache and sets the immutable flag, run it only when you intend to.
+system cache and sets the immutable flag, run it only when you intend to. It is one-shot — nothing
+keeps running in the background (shipping it as a LaunchAgent would clutter Login Items).
 
 ## Uninstall
 
 ```bash
 # 1. System Settings → Screen Saver → choose another saver (releases the store reference).
 # 2. Deregister and remove the app:
-pluginkit -r /Applications/MatrixSaver.app/Contents/PlugIns/MatrixSaver.appex
-rm -rf /Applications/MatrixSaver.app        # and ~/Applications/MatrixSaver.app if you built from source
+pluginkit -r ~/Applications/MatrixSaver.app/Contents/PlugIns/MatrixSaver.appex
+rm -rf ~/Applications/MatrixSaver.app
 killall WallpaperAgent
-# 3. If you applied the thumbnail workaround, unlock the cached PNGs first:
+# 3. If the thumbnail workaround was applied, unlock the cached PNGs first:
 #    chflags nouchg "$(getconf DARWIN_USER_CACHE_DIR)com.apple.wallpaper.extension.legacy/com.apple.wallpaper.legacy.thumbnails"/*.png
 ```
 
 ## Credits & references
 
-- **Full-screen renderer — © Monroe Williams.** The full-screen digital rain is Monroe
+- **On-screen renderer — © Monroe Williams.** The on-screen digital rain is Monroe
   Williams' Metal "Matrix" screensaver (`org.indirect.screensaver.Matrix`), bundled in the
   release at `Contents/Resources/Matrix.saver` (its `thumbnail.png` also backs the grid tile).
-  **This is a third-party work, redistributed under its own terms — it is not covered by this
-  project's license, and all credit for that renderer is his.**
+  It is shipped byte-for-byte and never re-signed. **This is a third-party work, redistributed
+  under its own terms — it is not covered by this project's license, and all credit for that
+  renderer is his.**
 - **CoreGraphics `MatrixView` renderer, ExtensionKit packaging, and build/install tooling** —
   original to this project.
 - **References** — Apple's `Computer Name.appex` (the ObjC blueprint), and the Aerial team's
