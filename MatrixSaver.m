@@ -1,9 +1,10 @@
 //  MatrixSaver.m — ExtensionKit .appex screensaver (macOS 14–27 / Tahoe).
 //
 //  Renders Monroe Williams' Matrix (org.indirect.screensaver.Matrix) on its METAL renderer,
-//  on every display including 2x Retina, at ~4% CPU — matching the 1x path on PaiMei.
+//  on every display including 2x Retina, at ~4% CPU — the same as on a 1x non-Retina display.
 //
-//  TWO fixes, both proven on DIMAS (2560x1664 2x Retina, macOS 27.0.1), are what make this work:
+//  TWO fixes, both proven on a 2x Retina MacBook Air (2560x1664, Apple Silicon, macOS 27), are what
+//  make this work:
 //
 //  (1) MONROE IS THE PRINCIPAL VIEW, not a subview.
 //      WallpaperAgent hosts the .appex out-of-process (ScreenSaverViewController is an

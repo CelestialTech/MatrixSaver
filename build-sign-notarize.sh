@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build MatrixSaver v1.6 (arm64) on asgard, Developer-ID sign OUR code only (never Monroe),
+# Build MatrixSaver v1.6 (arm64), Developer-ID sign OUR code only (never Monroe),
 # assert Monroe md5 unchanged, notarize + staple. Output: build/MatrixSaver.app ready to deploy.
 set -euo pipefail
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
