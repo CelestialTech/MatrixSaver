@@ -41,8 +41,6 @@ typedef struct {
     int    *_order;      // persistent back-to-front draw order (no per-frame malloc)
     double  _cellH;      // world height of one glyph cell
     double  _zNear, _zFar;
-    NSTimer *_timer;     // self-driven (SSENeedsAnimationTimer=false)
-    BOOL _wantAnim;      // controller asked us to animate
     BOOL _preview;
 }
 
@@ -51,6 +49,13 @@ typedef struct {
     if (self) {
         _preview = isPreview;
         NSLog(@"[MatrixSaver] MatrixView initWithFrame preview=%d bounds=%@", isPreview, NSStringFromRect(frame));
+
+        // HiDPI / out-of-process compositing: WallpaperAgent composites the saver via a shared
+        // IOSurface, which only a LAYER-BACKED view produces. Without this the view's drawRect
+        // output never crosses the process boundary and the saver is black on every display that
+        // needs the surface (notably 2x Retina). See makeBackingLayer + viewDidChangeBackingProperties.
+        self.wantsLayer = YES;
+        self.layerContentsRedrawPolicy = NSViewLayerContentsRedrawDuringViewResize;
 
         NSMutableArray *g = [NSMutableArray array];
         for (unichar c = 0xFF66; c <= 0xFF9D; c++)             // half-width katakana
@@ -80,7 +85,6 @@ typedef struct {
 }
 
 - (void)dealloc {
-    [_timer invalidate];
     if (_streams) free(_streams);
     if (_order)   free(_order);
     if (_advCache) free(_advCache);
@@ -123,26 +127,45 @@ static double frand(double a, double b) { return a + (b - a) * (arc4random_unifo
     return _advCache[sz];
 }
 
-- (void)startAnimation { [super startAnimation]; _wantAnim = YES; [self syncTimer]; }
-- (void)stopAnimation  { _wantAnim = NO; [self syncTimer]; [super stopAnimation]; }
+// Animation is HOST-DRIVEN: Info-appex.plist sets SSENeedsAnimationTimer=true, so the
+// screensaver host calls -animateOneFrame on us at the frame rate. This is the canonical
+// ScreenSaverView path (AppexSaverMinimal). We do NOT run our own NSTimer — a self-timer
+// gated on self.window never fires in the WallpaperAgent host (the hosted view can be
+// windowless), which is what left the CoreGraphics path black. Host-driven animateOneFrame
+// -> setNeedsDisplay -> drawRect fills the backing layer -> IOSurface -> composited.
+- (void)startAnimation { [super startAnimation]; }
+- (void)stopAnimation  { [super stopAnimation]; }
 
-// The timer runs ONLY while the view is both wanted-animating AND actually in a window.
-// This is what keeps the CoreGraphics path honest: an offscreen thumbnail snapshot draws
-// once without a spinning timer, and a churned/accumulated controller whose view was
-// never placed on-screen (Tahoe instance bug) burns zero CPU. On DIMAS's 2x Retina panel
-// a stray CG timer is ~4x the cost it is on PaiMei's 1x 1080p, so this gate matters.
-- (void)syncTimer {
-    BOOL shouldRun = (_wantAnim && self.window != nil);
-    if (shouldRun && !_timer) {
-        _timer = [NSTimer scheduledTimerWithTimeInterval:1.0/30.0 target:self
-                    selector:@selector(animateOneFrame) userInfo:nil repeats:YES];
-        _timer.tolerance = 1.0/120.0;                       // let the OS coalesce a little
-        [[NSRunLoop currentRunLoop] addTimer:_timer forMode:NSRunLoopCommonModes];
-    } else if (!shouldRun && _timer) {
-        [_timer invalidate]; _timer = nil;
-    }
+// Layer-backed so the content crosses the out-of-process boundary as an IOSurface.
+- (CALayer *)makeBackingLayer {
+    CALayer *l = [CALayer layer];
+    l.opaque = YES;
+    l.backgroundColor = NSColor.blackColor.CGColor;
+    l.contentsScale = [self mxBackingScale];
+    return l;
 }
-- (void)viewDidMoveToWindow { [super viewDidMoveToWindow]; [self syncTimer]; }
+
+// Backing scale without relying on self.window (nil in the hosted extension): derive it from
+// the view's own backing-store conversion, falling back to the main screen's scale.
+- (CGFloat)mxBackingScale {
+    NSSize pt = self.bounds.size;
+    if (pt.height <= 0) pt = NSMakeSize(1920, 1080);
+    NSSize px = [self convertSizeToBacking:pt];
+    CGFloat s = (pt.height > 0) ? (px.height / pt.height) : 1.0;
+    if (s < 1.0) s = 1.0;
+    if (s <= 1.0 && NSScreen.mainScreen.backingScaleFactor > 1.0) s = NSScreen.mainScreen.backingScaleFactor;
+    return s;
+}
+
+- (void)viewDidChangeBackingProperties {
+    [super viewDidChangeBackingProperties];
+    self.layer.contentsScale = [self mxBackingScale];
+    [self setNeedsDisplay:YES];
+}
+- (void)viewDidMoveToWindow {
+    [super viewDidMoveToWindow];
+    self.layer.contentsScale = [self mxBackingScale];
+}
 
 static int zcmp(void *ctx, const void *a, const void *b) {   // far (larger z) first
     const Stream *s = (const Stream *)ctx;

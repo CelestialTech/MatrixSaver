@@ -26,7 +26,7 @@ if [ -d "$SAVER/Contents/MacOS" ]; then
   codesign -f -s "$APPID" --timestamp --options runtime "$SAVER"
 fi
 codesign -f -s "$APPID" --timestamp --options runtime "$APPEX/Contents/MacOS/MatrixSaver"
-codesign -f -s "$APPID" --timestamp --options runtime --entitlements "$SRC/entitlements-appex.plist" "$APPEX"
+codesign -f -s "$APPID" --timestamp --options runtime --entitlements "$SRC/appex.entitlements" "$APPEX"
 codesign -f -s "$APPID" --timestamp --options runtime "$APP/Contents/MacOS/MatrixSaverHost"
 codesign -f -s "$APPID" --timestamp --options runtime "$APP"
 echo "--- verify ---"; codesign --verify --deep --strict --verbose=2 "$APP" 2>&1 | tail -2

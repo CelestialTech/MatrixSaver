@@ -17,9 +17,9 @@
 	<key>CFBundlePackageType</key>
 	<string>XPC!</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.8</string>
+	<string>2.0</string>
 	<key>CFBundleVersion</key>
-	<string>8</string>
+	<string>10</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
 	<key>NSExtension</key>
@@ -34,7 +34,7 @@
 	<key>SSEHasConfigureSheet</key>
 	<false/>
 	<key>SSENeedsAnimationTimer</key>
-	<false/>
+	<true/>
 	<key>ScreenSaverViewControllerClass</key>
 	<string>MatrixViewController</string>
 </dict>

@@ -23,8 +23,8 @@ echo "Monroe md5 before signing = $B"
 [ "$B" = "$MONROE_MD5" ] || { echo "FATAL: source Monroe md5 mismatch ($B != $MONROE_MD5)"; exit 8; }
 
 echo "=== Developer-ID sign OUR code only (Monroe is NOT touched) ==="
-codesign -f -s "$APPID" --timestamp --options runtime --entitlements "$SRC/entitlements-appex.plist" "$APPEX/Contents/MacOS/MatrixSaver"
-codesign -f -s "$APPID" --timestamp --options runtime --entitlements "$SRC/entitlements-appex.plist" "$APPEX"
+codesign -f -s "$APPID" --timestamp --options runtime --entitlements "$SRC/appex.entitlements" "$APPEX/Contents/MacOS/MatrixSaver"
+codesign -f -s "$APPID" --timestamp --options runtime --entitlements "$SRC/appex.entitlements" "$APPEX"
 codesign -f -s "$APPID" --timestamp --options runtime "$APP/Contents/MacOS/MatrixSaverHost"
 codesign -f -s "$APPID" --timestamp --options runtime "$APP"
 

@@ -13,8 +13,8 @@ ditto "$APP_SRC" "$STAGED"
 chflags -R nouchg "$STAGED" 2>/dev/null || true
 AX="$STAGED/Contents/PlugIns/MatrixSaver.appex"
 B=$(md5 -q "$AX/Contents/Resources/Matrix.saver/Contents/MacOS/"* | head -1)
-codesign -f -s "$APPID" --timestamp --options runtime --entitlements "$SRC/entitlements-appex.plist" "$AX/Contents/MacOS/MatrixSaver"
-codesign -f -s "$APPID" --timestamp --options runtime --entitlements "$SRC/entitlements-appex.plist" "$AX"
+codesign -f -s "$APPID" --timestamp --options runtime --entitlements "$SRC/appex.entitlements" "$AX/Contents/MacOS/MatrixSaver"
+codesign -f -s "$APPID" --timestamp --options runtime --entitlements "$SRC/appex.entitlements" "$AX"
 codesign -f -s "$APPID" --timestamp --options runtime "$STAGED/Contents/MacOS/MatrixSaverHost"
 codesign -f -s "$APPID" --timestamp --options runtime "$STAGED"
 A=$(md5 -q "$AX/Contents/Resources/Matrix.saver/Contents/MacOS/"* | head -1)
