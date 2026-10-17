@@ -58,74 +58,92 @@
 // its own Monroe Metal view as its principal view (GPU-cheap and resolution-independent) and
 // tears it down when it leaves the screen, so churned instances cost nothing.
 // ---------------------------------------------------------------------------
-static Class gMonroeClass = Nil;   // Matrix.saver principal class (loaded once)
-static BOOL  gMonroeTried = NO;    // bundle load attempted (success or fail), cached
-static BOOL  gRendererSet = NO;    // Monroe renderer pref written (once)
-static id    gActivity    = nil;   // process-global anti-App-Nap assertion
+#define MX_FALLBACK NSMakeRect(0, 0, 1920, 1080)   // used ONLY when the host supplies no real frame
 
-// Keep the render timer un-throttled for the whole process lifetime. WallpaperAgent otherwise
-// lets runningboardd park the extension at AppNap timer Tier5 on battery Macs, starving the
-// animation into a dark freeze. Held once, never per-controller.
-static void MXBeginActivityOnce(void) {
-    if (gActivity) return;
-    gActivity = [[NSProcessInfo processInfo]
-        beginActivityWithOptions:(NSActivityUserInitiated | NSActivityLatencyCritical)
-                          reason:@"MatrixSaver rendering"];
-    MXLOG(@"began process NSProcessInfo activity (anti App-Nap timer throttle)");
+static Class     gMonroeClass = Nil;   // Matrix.saver principal class (loaded once via dispatch_once)
+static id        gActivity    = nil;   // anti-App-Nap assertion, held ONLY while a saver is on-screen
+static NSInteger gOnScreen    = 0;     // count of controllers currently on-screen (main thread only)
+
+// Disable App-Nap / timer throttling ONLY while a saver view is actually on-screen. WallpaperAgent
+// otherwise lets runningboardd park the extension at AppNap timer Tier5 on battery Macs, starving the
+// animation into a dark freeze. Ref-counted across controllers (balanced by MXActivityRelease) so the
+// LatencyCritical assertion is released the moment the last on-screen controller goes away — never
+// held for the idle lifetime of the host process. Main-thread only (AppKit view lifecycle).
+static void MXActivityRetain(void) {
+    if (gOnScreen++ == 0 && !gActivity) {
+        gActivity = [[NSProcessInfo processInfo]
+            beginActivityWithOptions:(NSActivityUserInitiated | NSActivityLatencyCritical)
+                              reason:@"MatrixSaver rendering"];
+        MXLOG(@"App-Nap assertion BEGUN (first on-screen saver)");
+    }
+}
+static void MXActivityRelease(void) {
+    if (gOnScreen > 0 && --gOnScreen == 0 && gActivity) {
+        [[NSProcessInfo processInfo] endActivity:gActivity];
+        gActivity = nil;
+        MXLOG(@"App-Nap assertion ENDED (no on-screen saver)");
+    }
 }
 
 // Force Monroe onto its Metal renderer (0) before it builds its view. See fix (2) in the header.
-static void MXConfigureMonroeRendererOnce(void) {
-    if (gRendererSet) return;
-    gRendererSet = YES;
-    ScreenSaverDefaults *sd = [ScreenSaverDefaults defaultsForModuleWithName:@"org.indirect.screensaver.Matrix"];
-    [sd setInteger:0 forKey:@"renderer"];   // 0 = Metal (1 = OpenGL)
-    [sd synchronize];
-    MXLOG(@"Monroe renderer pref set to Metal(0); readback=%ld", (long)[sd integerForKey:@"renderer"]);
+// dispatch_once guarantees the pref WRITE completes before any controller proceeds to build Monroe
+// and that it happens exactly once per process.
+static void MXConfigureMonroeRenderer(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        ScreenSaverDefaults *sd = [ScreenSaverDefaults defaultsForModuleWithName:@"org.indirect.screensaver.Matrix"];
+        [sd setInteger:0 forKey:@"renderer"];   // 0 = Metal (1 = OpenGL)
+        [sd synchronize];
+        MXLOG(@"Monroe renderer pref set to Metal(0); readback=%ld", (long)[sd integerForKey:@"renderer"]);
+    });
 }
 
-// Load Monroe's principal class exactly once, caching success OR failure so a broken bundle is
-// not retried on every instance. This is the DYLD map that must not repeat.
+// Load Monroe's principal class exactly once (dispatch_once), caching success OR failure so a broken
+// bundle is not retried. This is the DYLD map that must not repeat under Tahoe VC churn.
 static Class MXMonroeClass(Class selfClass) {
-    if (gMonroeTried) return gMonroeClass;
-    gMonroeTried = YES;
-    NSString *base = [NSBundle bundleForClass:selfClass].bundlePath;
-    NSBundle *mb = [NSBundle bundleWithPath:
-        [base stringByAppendingPathComponent:@"Contents/Resources/Matrix.saver"]];
-    NSError *e = nil;
-    if (![mb loadAndReturnError:&e]) { MXLOG(@"Monroe load FAIL %@", e); return Nil; }
-    gMonroeClass = [mb principalClass];
-    MXLOG(@"Monroe bundle loaded once; class=%@", gMonroeClass);
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *base = [NSBundle bundleForClass:selfClass].bundlePath;
+        NSBundle *mb = [NSBundle bundleWithPath:
+            [base stringByAppendingPathComponent:@"Contents/Resources/Matrix.saver"]];
+        NSError *e = nil;
+        if (![mb loadAndReturnError:&e]) { MXLOG(@"Monroe load FAIL %@", e); return; }
+        gMonroeClass = [mb principalClass];
+        MXLOG(@"Monroe bundle loaded once; class=%@", gMonroeClass);
+    });
     return gMonroeClass;
 }
 
 @interface MatrixViewController : ScreenSaverViewController
 @end
 @implementation MatrixViewController {
-    ScreenSaverView *_monroe;   // Monroe's Metal view (the principal view, on-screen)
-    MatrixView      *_cg;       // layer-backed CoreGraphics rain — used only if Monroe won't load
-    BOOL             _built;    // guard: build the view exactly once per controller
+    ScreenSaverView *_monroe;        // Monroe's Metal view (the principal view, on-screen)
+    MatrixView      *_cg;            // layer-backed CoreGraphics rain — used only if Monroe won't load
+    BOOL             _built;         // guard: build the view exactly once per controller
+    BOOL             _heldActivity;  // whether THIS controller currently holds an App-Nap ref
 }
 
 // Primary entry: the framework hands us the real display frame + isPreview.
 - (void)loadViewForFrame:(NSRect)frame isPreview:(BOOL)isPreview {
-    if (frame.size.width < 2 || frame.size.height < 2) frame = NSMakeRect(0, 0, 1920, 1080);
+    if (frame.size.width < 2 || frame.size.height < 2) frame = MX_FALLBACK;
     [self buildForFrame:frame isPreview:isPreview];
 }
 // Fallback if the framework calls plain -loadView instead.
 - (void)loadView {
-    NSRect frame = NSScreen.mainScreen ? NSScreen.mainScreen.frame : NSMakeRect(0, 0, 1920, 1080);
+    NSRect frame = NSScreen.mainScreen ? NSScreen.mainScreen.frame : MX_FALLBACK;
     [self buildForFrame:frame isPreview:(frame.size.width < 400)];
 }
 
 - (void)buildForFrame:(NSRect)frame isPreview:(BOOL)isPreview {
     if (_built) return;
     _built = YES;
-    MXBeginActivityOnce();
-    MXConfigureMonroeRendererOnce();
+    MXConfigureMonroeRenderer();            // write renderer=Metal before Monroe is built
 
     Class c = MXMonroeClass([self class]);
     if (c) {
+        // isPreview:NO deliberately — on macOS 26/27 the Settings popover "preview" and the real
+        // idle run are the same on-screen host, and we always want Monroe's full render, not a
+        // reduced preview mode. (The CoreGraphics fallback below is told the real isPreview.)
         ScreenSaverView *m = [[c alloc] initWithFrame:frame isPreview:NO];
         if (m) {
             m.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
@@ -152,8 +170,8 @@ static Class MXMonroeClass(Class selfClass) {
 // super. Never called for the offscreen thumbnail snapshot, so Metal never spins up blank.
 - (void)viewDidAppear {
     [super viewDidAppear];
-    ScreenSaverView *v = _monroe ?: _cg;
-    @try { [v startAnimation]; } @catch (...) {}
+    if (!_heldActivity) { MXActivityRetain(); _heldActivity = YES; }
+    @try { [(_monroe ?: _cg) startAnimation]; } @catch (...) {}
     NSWindow *w = self.view.window;
     MXLOG(@"viewDidAppear level=%ld -> %@", w ? (long)w.level : -999, _monroe ? @"Monroe Metal" : @"CoreGraphics");
 }
@@ -161,9 +179,11 @@ static Class MXMonroeClass(Class selfClass) {
 - (void)viewDidDisappear {
     [super viewDidDisappear];
     @try { [(_monroe ?: _cg) stopAnimation]; } @catch (...) {}
+    if (_heldActivity) { MXActivityRelease(); _heldActivity = NO; }
 }
 
 - (void)dealloc {
     @try { [(_monroe ?: _cg) stopAnimation]; } @catch (...) {}
+    if (_heldActivity) { MXActivityRelease(); _heldActivity = NO; }
 }
 @end

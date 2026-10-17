@@ -58,18 +58,26 @@ nothing is quarantined.
 ## Uninstall
 
 Run **`MatrixSaver-Uninstall-<v>.pkg`** (double-click). It is a payload-free notarized package whose
-only job is a clean reversal: it deregisters the extension (`pluginkit -r`), clears the Matrix
-wallpaper Choice (the idle saver falls back to the system default), drops the module preference it
-set, unlocks and clears the locked thumbnail cache so tiles regenerate, removes
-`~/Applications/MatrixSaver.app`, forgets the install receipt (`pkgutil --forget`), and reloads the
-wallpaper agent. Uninstall-via-`.pkg` is a first-class deliverable alongside the installer — no
-manual Terminal steps required.
+only job is a clean, precise reversal: it clears **only** the Matrix wallpaper Choice (any other
+saver you had configured is left intact; the idle saver falls back to the system default),
+deregisters the extension (`pluginkit -r`), unlocks and clears the locked thumbnail cache so tiles
+regenerate, removes `~/Applications/MatrixSaver.app` **and the appex's sandbox container** (where the
+Monroe renderer pref was written), forgets the install receipt, and reloads the wallpaper agent. Uninstall-via-`.pkg` is a first-class deliverable alongside
+the installer — no manual Terminal steps required.
+
+> **If you remove the app by dragging it to the Trash instead of running the uninstaller**, the two
+> green thumbnail-cache PNGs the installer locked with `chflags uchg` are left behind (the lock is
+> what stops macOS regenerating the generic swirl over the green tile). They're harmless, but the
+> OS can't rewrite them until unlocked. Running the uninstaller `.pkg` clears them; by hand it's
+> `chflags -R nouchg "$(getconf DARWIN_USER_CACHE_DIR)com.apple.wallpaper.extension.legacy/com.apple.wallpaper.legacy.thumbnails"`.
 
 ## Requirements
 
 - **macOS 14–27** (Sonoma through the macOS 27 line).
-- **Apple Silicon (arm64).** The release binaries and the build scripts compile `-arch arm64` only;
-  Intel Macs need a universal rebuild.
+- **Universal — Apple Silicon and Intel** (`arm64 + x86_64`). Our code, the host app, the
+  `mxwallpaper` helper, and the bundled Monroe binary are all universal.
+- **No interpreter dependency.** The installer carries no Python/CLT requirement — the wallpaper
+  Choice is read/written by a compiled, signed helper shipped inside the app.
 - To build from source: Xcode Command Line Tools (`clang`), and Monroe Williams'
   `Matrix.saver` (see [Build from source](#build-from-source) — it is not bundled in this repo).
 
@@ -208,24 +216,30 @@ Two builders ship in the repo:
 ```bash
 ./build.sh                 # ad-hoc, local arm64 build: assembles the bundles, ad-hoc signs,
                            # installs to ~/Applications, and registers via pluginkit
-./build-pkg-notarize.sh    # the distributable: compiles arm64, signs ONLY your code
-                           # (asserts Monroe's md5 before and after), builds BOTH the installer
-                           # and uninstaller Developer-ID .pkgs, notarizes with notarytool, staples
+./build-pkg-notarize.sh    # the distributable: compiles UNIVERSAL (arm64+x86_64), signs ONLY your
+                           # code (asserts Monroe's sha256 before and after), builds BOTH the
+                           # installer and uninstaller Developer-ID .pkgs, notarizes + staples
 ```
 
 `build.sh` produces an **ad-hoc, local** build. For distributable artifacts use
 `build-pkg-notarize.sh`, which:
 
-1. **Compiles** `MatrixView.m` + `MatrixSaver.m` (`-arch arm64`, frameworks ScreenSaver / AppKit /
-   Foundation / QuartzCore / Metal, entry `_NSExtensionMain`) and the tiny host app.
-2. **Stages `Matrix.saver`** into the appex's `Contents/Resources` and **asserts its md5 is
-   unchanged** before and after signing (a FATAL guard — re-signing Monroe's binary renders black).
+1. **Compiles** `MatrixView.m` + `MatrixSaver.m` (**universal `arm64 + x86_64`**, frameworks
+   ScreenSaver / AppKit / Foundation / QuartzCore / Metal, entry `_NSExtensionMain`), the tiny host
+   app, and the **`mxwallpaper`** helper (a Foundation-only tool that reads/writes the wallpaper
+   Choice — so the installer needs **no `/usr/bin/python3`**, which a clean Mac may lack).
+2. **Stages `Matrix.saver`** into the appex's `Contents/Resources` and **asserts its sha256 is
+   unchanged** before and after signing, and that it is the only Mach-O in `MacOS/` (a FATAL guard —
+   re-signing Monroe's binary renders black).
 3. **Signs only your code** with `appex.entitlements`, `-o runtime --timestamp` Developer ID — the
-   appex binary and bundle, then the host app.
+   appex binary and bundle, the `mxwallpaper` helper, then the host app (helper before the main
+   executable, so the bundle seals cleanly without `--deep`, which would re-sign Monroe).
 4. Builds a **non-relocatable installer `.pkg`** (`--component-plist` with
-   `BundleIsRelocatable=false`) whose `postinstall` installs to `~/Applications`, selects Matrix,
-   runs the one-shot tile fix, and reloads `WallpaperAgent`; and a **payload-free uninstaller
-   `.pkg`** that fully reverses it.
+   `BundleIsRelocatable=false`) whose `postinstall` installs to `~/Applications`, registers the appex
+   (**retrying until `pluginkit` confirms**), selects Matrix via the helper and **verifies it stuck**,
+   runs the one-shot tile fix, and reloads `WallpaperAgent` — and **exits non-zero if registration or
+   the Choice fails**, so a broken install surfaces as an installer error, not a silent success. Plus
+   a **payload-free uninstaller `.pkg`** that precisely reverses it.
 5. **Notarizes + staples** both so they install with no Gatekeeper prompt.
 
 > **Forcing Monroe's Metal renderer is done in code, not by `defaults`.** The controller writes

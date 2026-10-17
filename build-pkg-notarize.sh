@@ -1,67 +1,92 @@
 #!/bin/bash
-# Fully reproducible MatrixSaver build + packaging (macOS 14–27, arm64).
+# Fully reproducible MatrixSaver build + packaging (macOS 14–27, UNIVERSAL arm64 + x86_64).
 #
 # Produces TWO notarized, stapled, Developer-ID-signed .pkg deliverables in dist/:
 #   MatrixSaver-<v>.pkg            install / idempotent upgrade (installs to ~/Applications,
 #                                  selects Matrix, forces Monroe onto Metal, locks the green
 #                                  thumbnail tile, reloads WallpaperAgent).
-#   MatrixSaver-Uninstall-<v>.pkg  full reversal (deregisters the appex, clears the Matrix
-#                                  wallpaper Choice, unlocks + clears the locked thumbnail
-#                                  cache, removes ~/Applications/MatrixSaver.app, forgets the
-#                                  install receipt, reloads WallpaperAgent).
+#   MatrixSaver-Uninstall-<v>.pkg  precise reversal (deregisters the appex via pluginkit -r,
+#                                  clears ONLY our wallpaper Choice, unlocks + clears
+#                                  the locked thumbnail cache, removes the app and the appex's
+#                                  sandbox container, forgets the receipt, reloads WallpaperAgent).
 #
-# Both postinstall scripts are CONTEXT-AWARE: they work when run as root (the GUI double-click /
-# `installer -target /` path, via installd → launchctl asuser + sudo -u) AND when run as the user
-# (the `installer -pkg … -target CurrentUserHomeDirectory` path, which needs no admin password and
-# is how the DIMAS lifecycle test runs). The payload source is resolved from the installer-supplied
-# destination, not a hardcoded /Library path, so a user-domain install finds its own payload.
+# NO interpreter dependency on the target Mac: the wallpaper Choice is read/written by a compiled,
+# universal, Foundation-only helper (Contents/MacOS/mxwallpaper) shipped signed inside the app —
+# NOT by /usr/bin/python3 (a Command Line Tools shim that may be absent on a clean Mac). The only
+# other tools the postinstalls use (sips, md5, getconf, chflags, pluginkit, lsregister, defaults)
+# are all base macOS.
 #
-# OUR code is signed with appex.entitlements (app-sandbox + disable-library-validation +
-# mach-lookup for CARenderServer/CoreDisplay/ViewBridge — the set Monroe needs to load and render
-# Metal under the hardened runtime). Monroe's binary is NEVER re-signed; the md5 is asserted
-# unchanged across signing (re-signing it makes Metal render black).
+# Both postinstalls are CONTEXT-AWARE: they work as root (GUI double-click / installer -target /,
+# via installd → launchctl asuser + sudo -u) AND as the user (installer -target CurrentUserHomeDirectory).
+# The install postinstall VERIFIES registration + Choice and exits NON-ZERO on failure, so a broken
+# install surfaces as an installer error instead of a silent "success".
+#
+# OUR code is signed with appex.entitlements (app-sandbox + disable-library-validation + mach-lookup
+# for CARenderServer/CoreDisplay/ViewBridge — the set Monroe needs to load and render Metal under the
+# hardened runtime). Monroe's binary is NEVER re-signed; its sha256 is asserted unchanged across
+# signing (re-signing it makes Metal render black).
 set -euo pipefail
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD="$SRC/build"; APP="$BUILD/MatrixSaver.app"
 APPEX="$APP/Contents/PlugIns/MatrixSaver.appex"; SAVER="$APPEX/Contents/Resources/Matrix.saver"
+HELPER_SRC="$SRC/mxwallpaper.m"
 DIST="$SRC/dist"
 APPID="Developer ID Application: Rodion Nazarov (LGAQBC2VM2)"
 INSTID="Developer ID Installer: Rodion Nazarov (LGAQBC2VM2)"
 ENT="$SRC/appex.entitlements"
-MONROE_MD5="b578c8f67450045cc653966c2992f86c"
+ARCHS="-arch arm64 -arch x86_64"                 # UNIVERSAL (Monroe's bundled binary is already fat)
+# --- single source of truth for identifiers/names (used in code-gen below) --------------------
+APPEX_ID="io.celestialtech.MatrixSaver.saver"    # the screensaver extension's bundle id
+PKG_ID="io.celestialtech.MatrixSaver"            # installer package id
+APP_NAME="MatrixSaver.app"
+APPEX_NAME="MatrixSaver.appex"
+MONROE_NAME="Matrix"                             # Monroe's single mach-o in Contents/MacOS
+MONROE_SHA256="131833308da3fd2a89a054c4b958c6a5a2c4a6e5feb9c0a441731318d4833dfe"
 VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$SRC/Info-app.plist")"
+sha(){ /usr/bin/shasum -a 256 "$1" | awk '{print $1}'; }
 
-echo "=== build app v$VERSION (arm64) ==="
-rm -rf "$BUILD" "$DIST"; mkdir -p "$APPEX/Contents/MacOS" "$APPEX/Contents/Resources" "$APP/Contents/MacOS" "$DIST"
-clang -fobjc-arc -O2 -arch arm64 -mmacosx-version-min=14.0 \
+echo "=== build app v$VERSION (universal arm64 + x86_64) ==="
+rm -rf "$BUILD" "$DIST"
+mkdir -p "$APPEX/Contents/MacOS" "$APPEX/Contents/Resources" "$APP/Contents/MacOS" "$DIST"
+clang -fobjc-arc -O2 $ARCHS -mmacosx-version-min=14.0 \
   -framework ScreenSaver -framework AppKit -framework Foundation -framework QuartzCore -framework Metal \
   -e _NSExtensionMain "$SRC/MatrixView.m" "$SRC/MatrixSaver.m" -o "$APPEX/Contents/MacOS/MatrixSaver"
 cp "$SRC/Info-appex.plist" "$APPEX/Contents/Info.plist"
 cp -R "$SRC/Matrix.saver" "$APPEX/Contents/Resources/"
-clang -fobjc-arc -O2 -arch arm64 -mmacosx-version-min=14.0 -framework Cocoa "$SRC/AppMain.m" -o "$APP/Contents/MacOS/MatrixSaverHost"
+clang -fobjc-arc -O2 $ARCHS -mmacosx-version-min=14.0 -framework Cocoa "$SRC/AppMain.m" -o "$APP/Contents/MacOS/MatrixSaverHost"
+clang -fobjc-arc -O2 $ARCHS -mmacosx-version-min=14.0 -framework Foundation "$HELPER_SRC" -o "$APP/Contents/MacOS/mxwallpaper"
 cp "$SRC/Info-app.plist" "$APP/Contents/Info.plist"
+# Ship the post-install configurator + the swirl reference tiles INSIDE the app (Resources are sealed
+# by the app signature). The postinstall launches mxpostconfig.sh detached, post-transaction.
+mkdir -p "$APP/Contents/Resources"
+cp "$SRC/mxpostconfig.sh" "$APP/Contents/Resources/mxpostconfig.sh"; chmod +x "$APP/Contents/Resources/mxpostconfig.sh"
+cp "$SRC/pkgbits/swirl_214.png" "$SRC/pkgbits/swirl_180.png" "$APP/Contents/Resources/"
 
-B=$(md5 -q "$SAVER/Contents/MacOS/"* | head -1); echo "Monroe md5 before = $B"
-[ "$B" = "$MONROE_MD5" ] || { echo "FATAL: source Monroe md5 mismatch"; exit 8; }
+B=$(sha "$SAVER/Contents/MacOS/$MONROE_NAME"); echo "Monroe sha256 before = $B"
+[ "$B" = "$MONROE_SHA256" ] || { echo "FATAL: source Monroe sha256 mismatch"; exit 8; }
+[ "$(ls -1 "$SAVER/Contents/MacOS/" | wc -l | tr -d ' ')" = "1" ] || { echo "FATAL: unexpected extra mach-o in Monroe MacOS/"; exit 8; }
 
 echo "=== sign OUR code only (Monroe untouched), with appex.entitlements ==="
 codesign -f -s "$APPID" --timestamp --options runtime --entitlements "$ENT" "$APPEX/Contents/MacOS/MatrixSaver"
 codesign -f -s "$APPID" --timestamp --options runtime --entitlements "$ENT" "$APPEX"
+# Sign the auxiliary helper BEFORE the bundle's main executable: signing the main executable
+# (MatrixSaverHost) validates sibling Mach-Os in Contents/MacOS, so mxwallpaper must be signed first.
+codesign -f -s "$APPID" --timestamp --options runtime "$APP/Contents/MacOS/mxwallpaper"
 codesign -f -s "$APPID" --timestamp --options runtime "$APP/Contents/MacOS/MatrixSaverHost"
 codesign -f -s "$APPID" --timestamp --options runtime "$APP"
-A=$(md5 -q "$SAVER/Contents/MacOS/"* | head -1); echo "Monroe md5 after  = $A"
+A=$(sha "$SAVER/Contents/MacOS/$MONROE_NAME"); echo "Monroe sha256 after  = $A"
 [ "$B" = "$A" ] || { echo "FATAL_SAVER_CHANGED"; exit 9; }
 codesign --verify --deep --strict "$APP" && echo "app signature OK"
 
-# A shell fragment shared by both postinstall scripts: resolve the target user/home and define
-# asuser()/runuser() that drop to that user when root, or run directly when already that user.
+# shared fragment for both postinstalls: resolve the target user/home + define asuser()/runuser()
+# that drop to that user when root, or run directly when already that user.
 read -r -d '' CTX_HELPER <<'CTX' || true
 if [ "$(/usr/bin/id -u)" = "0" ]; then
     CU=$(/usr/bin/stat -f%Su /dev/console)
     CUID=$(/usr/bin/id -u "$CU")
     UH=$(/usr/bin/dscl . -read /Users/"$CU" NFSHomeDirectory 2>/dev/null | /usr/bin/awk '{print $2}')
-    asuser()  { /bin/launchctl asuser "$CUID" /usr/bin/sudo -u "$CU" "$@"; }   # into the user's GUI session
-    runuser() { /usr/bin/sudo -u "$CU" "$@"; }
+    asuser()  { /bin/launchctl asuser "$CUID" /usr/bin/sudo -u "$CU" -H "$@"; }
+    runuser() { /usr/bin/sudo -u "$CU" -H "$@"; }
     AMROOT=1
 else
     CU=$(/usr/bin/whoami); CUID=$(/usr/bin/id -u); UH="$HOME"
@@ -71,118 +96,43 @@ else
 fi
 CTX
 
-# --- install-configuration scripts (install pkg postinstall uses these) -----------------------
-mk_activate_choice() {  # $1 = dest scripts dir ; selects Matrix via the wallpaper Choice
-cat > "$1/activate_choice.py" <<'ACTIVATE'
-import plistlib, sys, os
-appex=sys.argv[1]
-idx=os.path.expanduser("~/Library/Application Support/com.apple.wallpaper/Store/Index.plist")
-if not os.path.exists(idx): sys.exit(0)
-d=plistlib.load(open(idx,"rb"))
-cfg=plistlib.dumps({"module":{"relative":"file://"+appex}},fmt=plistlib.FMT_BINARY)
-choice={"Provider":"com.apple.wallpaper.choice.screen-saver","Files":[],"Configuration":cfg}
-n=0
-def patch(o):
-    global n
-    if isinstance(o,dict):
-        idle=o.get("Idle")
-        if isinstance(idle,dict) and isinstance(idle.get("Content"),dict):
-            idle["Content"]["Choices"]=[choice]; n+=1
-        for v in o.values(): patch(v)
-    elif isinstance(o,list):
-        for v in o: patch(v)
-patch(d); plistlib.dump(d,open(idx,"wb")); print("patched",n)
-ACTIVATE
-}
-mk_read_choice() {  # $1 = dest scripts dir ; exit 0 iff the wallpaper Choice references our appex
-cat > "$1/read_choice.py" <<'READ'
-import plistlib, os, sys
-p=os.path.expanduser("~/Library/Application Support/com.apple.wallpaper/Store/Index.plist")
-if not os.path.exists(p): sys.exit(1)
-d=plistlib.load(open(p,"rb")); f=[]
-def w(o):
-    if isinstance(o,dict):
-        [w(v) for v in o.values()]
-    elif isinstance(o,list):
-        [w(v) for v in o]
-    elif isinstance(o,bytes) and b"MatrixSaver.appex" in o: f.append(1)
-    elif isinstance(o,str) and "MatrixSaver.appex" in o: f.append(1)
-w(d); sys.exit(0 if f else 1)
-READ
-}
-mk_tile_fix() {  # $1 = dest scripts dir ; locks the green Monroe thumbnail over the swirl tile
-cat > "$1/matrix_tile_fix.sh" <<'TILEFIX'
-#!/bin/bash
-REF="$1"
-R="$HOME/Applications/MatrixSaver.app/Contents/PlugIns/MatrixSaver.appex/Contents/Resources/Matrix.saver/Contents/Resources"
-GREEN="$R/thumbnail@2x.png"; [ -f "$GREEN" ] || GREEN="$R/thumbnail.png"
-T="$(getconf DARWIN_USER_CACHE_DIR)com.apple.wallpaper.extension.legacy/com.apple.wallpaper.legacy.thumbnails"
-[ -d "$T" ] && [ -f "$GREEN" ] || exit 0
-s214=$(md5 -q "$REF/swirl_214.png" 2>/dev/null); s180=$(md5 -q "$REF/swirl_180.png" 2>/dev/null)
-tmp=$(mktemp -d)
-sips -z 130 214 "$GREEN" --out "$tmp/g214.png" >/dev/null 2>&1
-sips -z 116 180 "$GREEN" --out "$tmp/g180.png" >/dev/null 2>&1
-for f in "$T"/*.png; do
-  [ -e "$f" ] || continue
-  m=$(md5 -q "$f" 2>/dev/null)
-  [ "$m" = "$s214" ] && { chflags nouchg "$f" 2>/dev/null; cat "$tmp/g214.png" > "$f"; chflags uchg "$f" 2>/dev/null; }
-  [ "$m" = "$s180" ] && { chflags nouchg "$f" 2>/dev/null; cat "$tmp/g180.png" > "$f"; chflags uchg "$f" 2>/dev/null; }
-done
-rm -rf "$tmp"; exit 0
-TILEFIX
-}
-
 echo "=== stage INSTALL pkg payload + scripts ==="
 STAGE="$BUILD/pkgroot"; SCRIPTS="$BUILD/scripts"
 mkdir -p "$STAGE/Library/Application Support/MatrixSaver" "$SCRIPTS"
-ditto "$APP" "$STAGE/Library/Application Support/MatrixSaver/MatrixSaver.app"   # ditto: no ._ forks
-/usr/sbin/dot_clean -m "$STAGE" 2>/dev/null || true                            # strip any AppleDouble
-cp "$SRC/pkgbits/swirl_214.png" "$SRC/pkgbits/swirl_180.png" "$SCRIPTS/"
-mk_activate_choice "$SCRIPTS"
-mk_read_choice "$SCRIPTS"
-mk_tile_fix "$SCRIPTS"
+ditto "$APP" "$STAGE/Library/Application Support/MatrixSaver/$APP_NAME"
+/usr/sbin/dot_clean -m "$STAGE" 2>/dev/null || true
 
 {
 cat <<POSTHEAD
 #!/bin/bash
-SELF="\$(cd "\$(dirname "\$0")" && pwd)"
 $CTX_HELPER
 # Resolve the staged payload from the installer-supplied destination (\$3 volume, \$2 location),
 # so a user-domain install (base=\$HOME) finds its own copy rather than a hardcoded /Library path.
 STAGED=""
 for BASE in "\$3" "\$2" "" ; do
-  C="\$BASE/Library/Application Support/MatrixSaver/MatrixSaver.app"
+  C="\$BASE/Library/Application Support/MatrixSaver/${APP_NAME}"
   [ -d "\$C" ] && { STAGED="\$C"; break; }
 done
 [ -n "\$STAGED" ] || { echo "postinstall: staged payload not found"; exit 1; }
-DEST="\$UH/Applications/MatrixSaver.app"; AX="\$DEST/Contents/PlugIns/MatrixSaver.appex"
-/bin/rm -rf /Applications/MatrixSaver.app 2>/dev/null || true
+DEST="\$UH/Applications/${APP_NAME}"; AX="\$DEST/Contents/PlugIns/${APPEX_NAME}"
+CFG="\$DEST/Contents/Resources/mxpostconfig.sh"
+/bin/rm -rf /Applications/${APP_NAME} 2>/dev/null || true
 /bin/mkdir -p "\$UH/Applications"; /bin/rm -rf "\$DEST"
 /usr/bin/ditto "\$STAGED" "\$DEST"
-[ "\$AMROOT" = "1" ] && /usr/sbin/chown -R "\$CU":staff "\$UH/Applications/MatrixSaver.app" || true
+[ "\$AMROOT" = "1" ] && /usr/sbin/chown -R "\$CU":staff "\$UH/Applications/${APP_NAME}" || true
 /bin/rm -rf "\$(dirname "\$STAGED")" 2>/dev/null || true
 LSREG=/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister
 "\$LSREG" -f "\$DEST" || true
-# Register the appex, RETRYING until pkd confirms it. A single pluginkit -a on a freshly
-# ditto'd bundle frequently does not take inside the installer transaction (registration is
-# async), which left the saver unregistered and any Choice referencing an unknown appex (then
-# dropped by WallpaperAgent on reload). Re-run pluginkit -a while polling pluginkit -m, ~10s.
-reg() { asuser /usr/bin/pluginkit -m -i io.celestialtech.MatrixSaver.saver 2>/dev/null | /usr/bin/grep -c Matrix; }
-asuser /usr/bin/pluginkit -a "\$AX" 2>/dev/null || true
-for _i in \$(/usr/bin/seq 1 20); do [ "\$(reg)" != "0" ] && break; /bin/sleep 0.5; asuser /usr/bin/pluginkit -a "\$AX" 2>/dev/null || true; done
-runuser /bin/bash "\$SELF/matrix_tile_fix.sh" "\$SELF" 2>/dev/null || true
-# Select Matrix and reload the agent, then VERIFY the Choice survived (a Choice whose appex was
-# not yet registered gets dropped on reload); re-apply up to 5x until it sticks.
-for _i in \$(/usr/bin/seq 1 5); do
-  runuser /usr/bin/python3 "\$SELF/activate_choice.py" "\$AX" 2>/dev/null || true
-  asuser /usr/bin/killall WallpaperAgent 2>/dev/null || true
-  /bin/sleep 1
-  runuser /usr/bin/python3 "\$SELF/read_choice.py" 2>/dev/null && break
-done
+# Register the appex and select Matrix via mxpostconfig.sh (shipped in the app), run SYNCHRONOUSLY in
+# the console user's GUI session (asuser) — registration takes a few seconds and needs retries, which
+# it does. The installer does NOT fail on a slow/failed config (that must not turn a good payload
+# install into an installer error); the outcome is recorded in ~/Library/Logs/MatrixSaver-install.log
+# and re-running the installer re-runs this step.
+asuser "\$CFG" "\$AX" 2>/dev/null || true
 exit 0
 POSTHEAD
 } > "$SCRIPTS/postinstall"
-chmod +x "$SCRIPTS/postinstall" "$SCRIPTS/matrix_tile_fix.sh"
+chmod +x "$SCRIPTS/postinstall"
 
 echo "=== component plist: mark the app NON-relocatable (force install path) ==="
 COMP="$BUILD/component.plist"
@@ -192,42 +142,34 @@ i=0; while [ "$i" -lt "$N" ]; do /usr/libexec/PlistBuddy -c "Set :$i:BundleIsRel
 
 echo "=== build + sign INSTALL .pkg ==="
 INSTALL_PKG="$DIST/MatrixSaver-$VERSION.pkg"
-pkgbuild --root "$STAGE" --component-plist "$COMP" --scripts "$SCRIPTS" --identifier io.celestialtech.MatrixSaver \
+pkgbuild --root "$STAGE" --component-plist "$COMP" --scripts "$SCRIPTS" --identifier "$PKG_ID" \
   --version "$VERSION" --install-location / --sign "$INSTID" --timestamp "$INSTALL_PKG"
 
 echo "=== stage UNINSTALL pkg (nopayload: scripts only) ==="
 USCRIPTS="$BUILD/uscripts"; mkdir -p "$USCRIPTS"
-cat > "$USCRIPTS/deactivate_choice.py" <<'DEACT'
-import plistlib, os
-idx=os.path.expanduser("~/Library/Application Support/com.apple.wallpaper/Store/Index.plist")
-if not os.path.exists(idx): raise SystemExit(0)
-d=plistlib.load(open(idx,"rb"))
-n=0
-def patch(o):
-    global n
-    if isinstance(o,dict):
-        idle=o.get("Idle")
-        if isinstance(idle,dict) and isinstance(idle.get("Content"),dict) and idle["Content"].get("Choices"):
-            idle["Content"]["Choices"]=[]; n+=1
-        for v in o.values(): patch(v)
-    elif isinstance(o,list):
-        for v in o: patch(v)
-patch(d); plistlib.dump(d,open(idx,"wb")); print("cleared",n)
-DEACT
-
 {
 cat <<UPOSTHEAD
 #!/bin/bash
-SELF="\$(cd "\$(dirname "\$0")" && pwd)"
 $CTX_HELPER
-DEST="\$UH/Applications/MatrixSaver.app"; AX="\$DEST/Contents/PlugIns/MatrixSaver.appex"
+DEST="\$UH/Applications/${APP_NAME}"; AX="\$DEST/Contents/PlugIns/${APPEX_NAME}"
+HELPER="\$DEST/Contents/MacOS/mxwallpaper"
+# Clear ONLY our wallpaper Choice (the helper leaves any other saver the user configured) BEFORE we
+# remove the app the helper lives in. If the app was already trashed, the stale Choice is harmless —
+# WallpaperAgent drops a Choice pointing at a missing appex on its own.
+[ -x "\$HELPER" ] && runuser "\$HELPER" deactivate 2>/dev/null || true
+# Deregister the extension (pluginkit -r). We do NOT lsregister -u the bundle: it is unnecessary for
+# a clean uninstall and can disrupt pkd so a subsequent reinstall is slow to register.
 [ -d "\$AX" ] && asuser /usr/bin/pluginkit -r "\$AX" 2>/dev/null || true
-runuser /usr/bin/python3 "\$SELF/deactivate_choice.py" 2>/dev/null || true
-runuser /usr/bin/defaults -currentHost delete com.apple.screensaver moduleDict 2>/dev/null || true
+# Unlock + clear the (locked) legacy thumbnail cache so tiles regenerate clean.
 T="\$(runuser /usr/bin/getconf DARWIN_USER_CACHE_DIR)com.apple.wallpaper.extension.legacy/com.apple.wallpaper.legacy.thumbnails"
 [ -d "\$T" ] && { /usr/bin/chflags -R nouchg "\$T" 2>/dev/null; /bin/rm -f "\$T"/*.png 2>/dev/null; } || true
-/bin/rm -rf "\$DEST" /Applications/MatrixSaver.app "/Library/Application Support/MatrixSaver" 2>/dev/null || true
-/usr/sbin/pkgutil --forget io.celestialtech.MatrixSaver 2>/dev/null || true
+# Remove the app, any stray copies, the staged payload, AND the appex's sandbox container (which
+# holds the Monroe renderer pref this product wrote).
+/bin/rm -rf "\$DEST" /Applications/${APP_NAME} "/Library/Application Support/MatrixSaver" 2>/dev/null || true
+/bin/rm -rf "\$UH/Library/Containers/${APPEX_ID}" 2>/dev/null || true
+# Forget the receipt (needs root; in the user-domain path this is a no-op and the next install is a
+# harmless "upgrade").
+/usr/sbin/pkgutil --forget ${PKG_ID} 2>/dev/null || true
 asuser /usr/bin/killall WallpaperAgent 2>/dev/null || true
 exit 0
 UPOSTHEAD
@@ -236,7 +178,7 @@ chmod +x "$USCRIPTS/postinstall"
 
 echo "=== build + sign UNINSTALL .pkg ==="
 UNINSTALL_PKG="$DIST/MatrixSaver-Uninstall-$VERSION.pkg"
-pkgbuild --nopayload --scripts "$USCRIPTS" --identifier io.celestialtech.MatrixSaver.uninstall \
+pkgbuild --nopayload --scripts "$USCRIPTS" --identifier "${PKG_ID}.uninstall" \
   --version "$VERSION" --sign "$INSTID" --timestamp "$UNINSTALL_PKG"
 
 echo "=== notarize + staple BOTH pkgs ==="
@@ -251,4 +193,6 @@ for P in "$INSTALL_PKG" "$UNINSTALL_PKG"; do
   spctl -a -vvv --type install "$P" 2>&1 | tail -2
   ls -la "$P"
 done
+echo "=== universal check (both arches present in our binaries) ==="
+lipo -archs "$APPEX/Contents/MacOS/MatrixSaver"; lipo -archs "$APP/Contents/MacOS/mxwallpaper"
 echo "PKG_DONE install=$INSTALL_PKG uninstall=$UNINSTALL_PKG"

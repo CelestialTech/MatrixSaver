@@ -1,20 +1,24 @@
 //
 //  MatrixView.m — 3D "flying into the depth" Matrix rain (CoreGraphics).
 //
-//  Reproduces the GLMatrix-style effect (glyph streams positioned in 3D space that recede
-//  into the distance, shrinking and fading into darkness) using perspective-projected Core
-//  Graphics text drawing. CG renders reliably inside the sandboxed screensaver host on
-//  macOS 27, unlike OpenGL (which renders black) — so the classic 3D effect is ported
-//  forward natively. This is the OFFSCREEN THUMBNAIL renderer; the on-screen idle run uses
-//  Monroe's Metal Matrix (see MatrixSaver.m).
+//  Reproduces the GLMatrix-style effect (glyph streams positioned in 3D space that recede into
+//  the distance, shrinking and fading into darkness) using perspective-projected Core Graphics
+//  text drawing. This is the LOAD-FAILURE FALLBACK renderer: MatrixViewController makes it its
+//  principal view ONLY when Monroe's Metal Matrix.saver bundle fails to load. The normal on-screen
+//  renderer is Monroe's Metal Matrix, and the picker grid tile is a static PNG the installer locks
+//  into the thumbnail cache — so this view draws only when Monroe is unavailable (see MatrixSaver.m).
 //
-//  Performance (rewritten 2026-10-16): the draw path previously malloc'd an index buffer
-//  and ran an O(n^2) insertion sort over 240 streams on EVERY frame, and measured every
-//  glyph with -sizeWithAttributes:. The depth sort is now qsort over a persistent buffer
-//  and glyph metrics are cached per point size, so a frame no longer allocates or does
-//  quadratic work. The view also drives its own NSTimer (Info-appex.plist sets
-//  SSENeedsAnimationTimer=false) so it does not depend on the flaky framework timer and
-//  it stops cleanly the moment it leaves the screen.
+//  HiDPI: like Monroe's principal view, this MUST be layer-backed so WallpaperAgent can composite
+//  it across the XPC boundary as a shared IOSurface at the display's real backing scale — otherwise
+//  it renders black on 2x Retina (see makeBackingLayer + mxBackingScale below).
+//
+//  Animation is HOST-DRIVEN: Info-appex.plist sets SSENeedsAnimationTimer=true, so the host calls
+//  -animateOneFrame at the frame rate. We do NOT run our own NSTimer — a self-timer gated on
+//  self.window never fires in the windowless hosted extension, which is what left this path black.
+//
+//  Performance: the draw path uses a persistent qsort order buffer (no per-frame malloc, no O(n^2)
+//  insertion sort over the 240 streams) and caches glyph metrics per point size, so a frame neither
+//  allocates nor does quadratic work.
 //
 #import <ScreenSaver/ScreenSaver.h>
 #import <AppKit/AppKit.h>
