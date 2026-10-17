@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/hero.gif" alt="Matrix digital-rain screensaver — green katakana glyph streams falling into depth on black" width="100%">
+  <img src="assets/metal.gif" alt="Matrix digital-rain screensaver — green katakana glyph streams falling into depth on black" width="100%">
 </p>
 
 <h1 align="center">MatrixSaver</h1>
