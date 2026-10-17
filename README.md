@@ -22,6 +22,17 @@ as the extension's principal view so it renders correctly — and at ~4% CPU —
 display, including 2× Retina. An original CoreGraphics renderer is kept only as a load-failure
 fallback; the picker thumbnail is a locked green tile (Monroe's Metal cannot draw offscreen).
 
+### Metal vs OpenGL
+
+Monroe's saver ships defaulting to an **OpenGL** renderer, which on Apple Silicon / macOS 27 is
+CPU-emulated — sparse, flat, and ~90% CPU. MatrixSaver forces the **Metal** renderer in-process
+(~4% CPU, dense and depth-shaded). The difference:
+
+| Metal (what this ships) | OpenGL (Monroe's default) |
+|---|---|
+| ![Metal render](assets/metal.gif) | ![OpenGL render](assets/openCL.gif) |
+| GPU, ~4% CPU, depth-shaded 3D rain | CPU-emulated, ~90% CPU, flat & sparse |
+
 ## Contents
 
 - [Install](#install) · [Uninstall](#uninstall) · [Requirements](#requirements)
@@ -299,6 +310,28 @@ chflags uchg "$T"/<matrix-hash>.png          # lock so the picker can't overwrit
 The uninstaller reverses this (`chflags -R nouchg` + clear the cache so the swirl regenerates).
 Because it overwrites a system cache and sets the immutable flag, the installer runs it one-shot —
 nothing keeps running in the background (shipping it as a LaunchAgent would clutter Login Items).
+
+## Design notes & known limitations
+
+Deliberate trade-offs, recorded after a design review:
+
+- **No configure sheet (`SSEHasConfigureSheet=false`).** The renderer is force-set to Metal every
+  launch, on purpose — OpenGL is strictly worse here (CPU-emulated, ~90% CPU), so a renderer toggle
+  would only let you pick the worse path. A settings UI is intentionally omitted rather than built
+  speculatively.
+- **The green picker tile is locked (`chflags uchg`).** That lock is what stops macOS regenerating
+  the generic swirl over it. The cost: removing the app by dragging it to the Trash (instead of
+  running the uninstaller) leaves two locked cache PNGs behind. The uninstaller clears them; see
+  [Uninstall](#uninstall).
+- **Per-user install from a system package.** The `.pkg` installs to `/` then relocates the app to
+  `~/Applications` (the wallpaper store resolves a per-user absolute path). Two consequences: the
+  install receipt points at a payload the postinstall has moved, so `pkgutil --verify` on the
+  receipt will not match; and a user-domain uninstall (`installer -target CurrentUserHomeDirectory`)
+  cannot `pkgutil --forget` the system receipt without root, so a later reinstall shows as an
+  "upgrade". Both are cosmetic — install, render, and uninstall are unaffected.
+- **MDM / zero-touch.** The postinstall skips per-user configuration when there is no regular
+  console user (Setup Assistant, the login window) rather than installing for the wrong account.
+- **Scope: single (console) user.** A system-wide / all-users install is out of scope by design.
 
 ## Credits & references
 

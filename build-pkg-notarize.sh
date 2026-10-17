@@ -83,8 +83,17 @@ codesign --verify --deep --strict "$APP" && echo "app signature OK"
 read -r -d '' CTX_HELPER <<'CTX' || true
 if [ "$(/usr/bin/id -u)" = "0" ]; then
     CU=$(/usr/bin/stat -f%Su /dev/console)
-    CUID=$(/usr/bin/id -u "$CU")
+    CUID=$(/usr/bin/id -u "$CU" 2>/dev/null)
+    # Guard against a non-regular console user — Setup Assistant (_mbsetupuser), the login window,
+    # or no GUI user at all (MDM / zero-touch deploy fires the pkg before a user session). Installing
+    # for the wrong account is worse than deferring, so skip per-user work cleanly (the payload stays
+    # staged; a later run with a real console user configures it).
+    case "$CU" in ""|root|_mbsetupuser|loginwindow|_*)
+        echo "no regular console user ($CU); skipping per-user configuration"; exit 0;;
+    esac
+    [ "${CUID:-0}" -ge 501 ] 2>/dev/null || { echo "console user $CU uid<501; skipping"; exit 0; }
     UH=$(/usr/bin/dscl . -read /Users/"$CU" NFSHomeDirectory 2>/dev/null | /usr/bin/awk '{print $2}')
+    [ -n "$UH" ] || { echo "no home for $CU; skipping"; exit 0; }
     asuser()  { /bin/launchctl asuser "$CUID" /usr/bin/sudo -u "$CU" -H "$@"; }
     runuser() { /usr/bin/sudo -u "$CU" -H "$@"; }
     AMROOT=1
