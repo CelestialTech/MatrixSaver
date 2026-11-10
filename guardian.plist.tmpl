@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Per-user guardian for the Matrix screen saver. The installer substitutes __PROGRAM__ (the
+     signed mxguardian helper in the installed app) and __STORE__ (this user's wallpaper Store),
+     then writes the result to ~/Library/LaunchAgents/io.celestialtech.MatrixSaver.guardian.plist
+     and bootstraps it. RunAtLoad catches post-OS-update logins; WatchPaths fires only when the
+     wallpaper Store actually changes. No timer, no KeepAlive — mxguardian exits immediately when
+     Matrix is already the active, registered saver, so this never spams background activity. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.celestialtech.MatrixSaver.guardian</string>
+    <key>Program</key>
+    <string>__PROGRAM__</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>WatchPaths</key>
+    <array>
+        <string>__STORE__</string>
+    </array>
+</dict>
+</plist>

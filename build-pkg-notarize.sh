@@ -40,6 +40,7 @@ APPEX_ID="io.celestialtech.MatrixSaver.saver"    # the screensaver extension's b
 PKG_ID="io.celestialtech.MatrixSaver"            # installer package id
 APP_NAME="MatrixSaver.app"
 APPEX_NAME="MatrixSaver.appex"
+GUARD_LABEL="io.celestialtech.MatrixSaver.guardian"  # per-user guardian LaunchAgent label
 MONROE_NAME="Matrix"                             # Monroe's single mach-o in Contents/MacOS
 MONROE_SHA256="131833308da3fd2a89a054c4b958c6a5a2c4a6e5feb9c0a441731318d4833dfe"
 VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$SRC/Info-app.plist")"
@@ -55,12 +56,17 @@ cp "$SRC/Info-appex.plist" "$APPEX/Contents/Info.plist"
 cp -R "$SRC/Matrix.saver" "$APPEX/Contents/Resources/"
 clang -fobjc-arc -O2 $ARCHS -mmacosx-version-min=14.0 -framework Cocoa "$SRC/AppMain.m" -o "$APP/Contents/MacOS/MatrixSaverHost"
 clang -fobjc-arc -O2 $ARCHS -mmacosx-version-min=14.0 -framework Foundation "$HELPER_SRC" -o "$APP/Contents/MacOS/mxwallpaper"
+# The guardian: a tiny signed Foundation binary a per-user LaunchAgent runs at login + on wallpaper
+# Store changes; it re-selects Matrix after a macOS update (or the Wallpaper dialog) reverts it.
+clang -fobjc-arc -O2 $ARCHS -mmacosx-version-min=14.0 -framework Foundation "$SRC/mxguardian.m" -o "$APP/Contents/MacOS/mxguardian"
 cp "$SRC/Info-app.plist" "$APP/Contents/Info.plist"
 # Ship the post-install configurator + the swirl reference tiles INSIDE the app (Resources are sealed
 # by the app signature). The postinstall launches mxpostconfig.sh detached, post-transaction.
 mkdir -p "$APP/Contents/Resources"
 cp "$SRC/mxpostconfig.sh" "$APP/Contents/Resources/mxpostconfig.sh"; chmod +x "$APP/Contents/Resources/mxpostconfig.sh"
 cp "$SRC/pkgbits/swirl_214.png" "$SRC/pkgbits/swirl_180.png" "$APP/Contents/Resources/"
+# Guardian LaunchAgent template (installer substitutes __PROGRAM__/__STORE__ and bootstraps it).
+cp "$SRC/guardian.plist.tmpl" "$APP/Contents/Resources/guardian.plist.tmpl"
 
 B=$(sha "$SAVER/Contents/MacOS/$MONROE_NAME"); echo "Monroe sha256 before = $B"
 [ "$B" = "$MONROE_SHA256" ] || { echo "FATAL: source Monroe sha256 mismatch"; exit 8; }
@@ -72,6 +78,7 @@ codesign -f -s "$APPID" --timestamp --options runtime --entitlements "$ENT" "$AP
 # Sign the auxiliary helper BEFORE the bundle's main executable: signing the main executable
 # (MatrixSaverHost) validates sibling Mach-Os in Contents/MacOS, so mxwallpaper must be signed first.
 codesign -f -s "$APPID" --timestamp --options runtime "$APP/Contents/MacOS/mxwallpaper"
+codesign -f -s "$APPID" --timestamp --options runtime "$APP/Contents/MacOS/mxguardian"
 codesign -f -s "$APPID" --timestamp --options runtime "$APP/Contents/MacOS/MatrixSaverHost"
 codesign -f -s "$APPID" --timestamp --options runtime "$APP"
 A=$(sha "$SAVER/Contents/MacOS/$MONROE_NAME"); echo "Monroe sha256 after  = $A"
@@ -138,6 +145,23 @@ LSREG=/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/La
 # install into an installer error); the outcome is recorded in ~/Library/Logs/MatrixSaver-install.log
 # and re-running the installer re-runs this step.
 asuser "\$CFG" "\$AX" 2>/dev/null || true
+# --- install the guardian LaunchAgent: re-selects Matrix whenever macOS reverts it (a point update
+# resets the Choice AND de-registers the appex; the Wallpaper dialog can also clear it). It runs the
+# SIGNED mxguardian helper (not a .sh, so the Login Items entry shows the developer, not a script),
+# at login (RunAtLoad) and only when the wallpaper Store changes (WatchPaths) — no timer, and it
+# exits immediately when Matrix is already active, so it never spams background activity.
+GL="${GUARD_LABEL}"
+PLA="\$UH/Library/LaunchAgents"; PL="\$PLA/\$GL.plist"
+TMPL="\$DEST/Contents/Resources/guardian.plist.tmpl"
+STORE="\$UH/Library/Application Support/com.apple.wallpaper/Store/Index.plist"
+if [ -f "\$TMPL" ]; then
+  /bin/mkdir -p "\$PLA"
+  /usr/bin/sed -e "s|__PROGRAM__|\$DEST/Contents/MacOS/mxguardian|" -e "s|__STORE__|\$STORE|" "\$TMPL" > "\$PL"
+  [ "\$AMROOT" = "1" ] && /usr/sbin/chown "\$CU":staff "\$PL" || true
+  /bin/chmod 644 "\$PL"
+  asuser /bin/launchctl bootout gui/"\$CUID"/"\$GL" 2>/dev/null || true
+  asuser /bin/launchctl bootstrap gui/"\$CUID" "\$PL" 2>/dev/null || true
+fi
 exit 0
 POSTHEAD
 } > "$SCRIPTS/postinstall"
@@ -162,6 +186,10 @@ cat <<UPOSTHEAD
 $CTX_HELPER
 DEST="\$UH/Applications/${APP_NAME}"; AX="\$DEST/Contents/PlugIns/${APPEX_NAME}"
 HELPER="\$DEST/Contents/MacOS/mxwallpaper"
+# Remove the guardian LaunchAgent FIRST, so it cannot re-select Matrix while we are uninstalling.
+GL="${GUARD_LABEL}"
+asuser /bin/launchctl bootout gui/"\$CUID"/"\$GL" 2>/dev/null || true
+/bin/rm -f "\$UH/Library/LaunchAgents/\$GL.plist" 2>/dev/null || true
 # Clear ONLY our wallpaper Choice (the helper leaves any other saver the user configured) BEFORE we
 # remove the app the helper lives in. If the app was already trashed, the stale Choice is harmless —
 # WallpaperAgent drops a Choice pointing at a missing appex on its own.
@@ -203,5 +231,5 @@ for P in "$INSTALL_PKG" "$UNINSTALL_PKG"; do
   ls -la "$P"
 done
 echo "=== universal check (both arches present in our binaries) ==="
-lipo -archs "$APPEX/Contents/MacOS/MatrixSaver"; lipo -archs "$APP/Contents/MacOS/mxwallpaper"
+lipo -archs "$APPEX/Contents/MacOS/MatrixSaver"; lipo -archs "$APP/Contents/MacOS/mxwallpaper"; lipo -archs "$APP/Contents/MacOS/mxguardian"
 echo "PKG_DONE install=$INSTALL_PKG uninstall=$UNINSTALL_PKG"

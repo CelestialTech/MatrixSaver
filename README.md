@@ -158,6 +158,29 @@ same observed window level (`-2147483625`), indistinguishable from inside the ex
 level, or occlusion. Both therefore get Monroe. Only the offscreen thumbnail snapshot cannot run
 Monroe (Metal renders blank there), which is why the grid tile is a locked PNG, below.
 
+## Guardian — keeping Matrix selected across macOS updates (v2.3)
+
+A macOS **point update** resets the Idle screen-saver Choice back to the default aerial
+("Golden Gate") **and** drops the appex from `pluginkit` — so after every update the saver silently
+reverts. The Wallpaper settings dialog can also clear the Choice. v2.3 adds a **guardian** that
+re-selects Matrix automatically, by construction quiet:
+
+- `Contents/MacOS/mxguardian` — a tiny Developer-ID-signed Foundation binary. On each run it does two
+  cheap reads (is our Choice active? is the appex registered?) and, if both already hold, **exits 0
+  immediately** — no work, no `WallpaperAgent` reload, nothing visible. Only on an actual revert does
+  it re-run the shipped `mxpostconfig.sh` (re-register + re-select). It is a **compiled signed Mach-O,
+  not a `.sh`**, so the Login Items / Background-items entry is attributed to the developer, not shown
+  as an anonymous script row.
+- A per-user LaunchAgent `io.celestialtech.MatrixSaver.guardian` (template
+  `guardian.plist.tmpl`, path-substituted and bootstrapped by the installer) runs it with
+  **`RunAtLoad`** (catches the post-update login, when both the Choice and the registration were
+  reset) and **`WatchPaths`** on `~/Library/Application Support/com.apple.wallpaper/Store/Index.plist`
+  (fires only when the wallpaper Store actually changes). There is **no timer and no `KeepAlive`** —
+  so it never polls and never generates background-activity noise. Measured restore latency after a
+  revert is ~1s. Actions are logged to `~/Library/Logs/MatrixSaver-guardian.log`.
+
+The uninstaller boots out and removes the agent before clearing the Choice, so uninstall is clean.
+
 ## Building it as a modern .appex
 
 The `Info.plist` keys that make the bundle a screensaver extension:
